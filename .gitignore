@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Frontend production build
+dist/
+
+# Logs & cache
+*.log
+.DS_Store
+
+# Tauri & Rust build artifacts (safety for monorepo roots)
+src-tauri/target/
+src-tauri/gen/schemas/
