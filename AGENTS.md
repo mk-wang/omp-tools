@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Overview
-**OMP Model Studio** is a lightweight desktop control plane for [Oh My Pi (`omp`)](https://github.com/canis-aur/oh-my-pi). It provides a visual interface for managing and previewing:
+**OMP Model Studio** is a lightweight desktop control plane for [Oh My Pi (`omp`)](https://github.com/can1357/oh-my-pi). It provides a visual interface for managing and previewing:
 - **Built-in & Custom Model Roles**: Configures `modelRoles.*` selectors (e.g. `@slow`, `@smol`, `@tester`) across configured providers and thinking efforts.
 - **Built-in Agent Model Overrides**: Configures model selectors for bundled agents (`reviewer`, `security-reviewer`) under `task.agentModelOverrides.*`.
 - **Custom Agent Definitions**: Visual authoring and editing for standalone agent definitions (`~/.omp/agent/agents/*.md`) with frontmatter metadata.
@@ -43,8 +43,8 @@ The app is built as a single-window Tauri v2 desktop application with a React 19
    - `types.ts` maintains TypeScript interfaces matching Rust IPC payloads.
 2. **Backend Layer (`src-tauri/src/lib.rs`)**:
    - Locates user OMP paths via environment variables (`HOME` / `USERPROFILE`).
-   - `load_snapshot` queries installed models by running `omp models --json`, parsing `~/.omp/agent/models.yml`, reading `config.yml`, and loading markdown agent definitions from `~/.omp/agent/agents/`.
-   - `save_snapshot` validates inputs, updates only target YAML mappings while preserving unrecognized keys and comments, writes standalone agent markdown files, and uses temporary files (`.<name>.omp-model-studio.tmp`) with atomic rename replacement.
+   - `load_snapshot` queries installed models by running `omp models --json`; when discovery fails, it falls back to `~/.omp/agent/models.yml` or `models.yaml`, reads `config.yml` or `config.yaml`, and loads markdown agent definitions from `~/.omp/agent/agents/`.
+   - `save_snapshot` validates inputs, updates only target YAML mappings while preserving unrecognized keys (YAML serialization may rewrite formatting and comments), writes standalone agent markdown files, and uses temporary files (`.<name>.omp-model-studio.tmp`) with atomic rename replacement.
 
 ---
 
@@ -106,7 +106,7 @@ bun run tauri build
 - **CSS Architecture**: Single vanilla stylesheet `src/styles.css` utilizing CSS variables, `color-mix`, and semantic tokens (`--bg`, `--panel`, `--border`, `--accent`).
 
 ### 3. Rust Backend Conventions
-- **Non-Destructive Config Mutation**: `update_yaml_config()` parses `config.yml` into a dynamic `serde_yaml::Value::Mapping` to update only managed sections (`modelRoles`, `task.agentModelOverrides`, `disabledProviders`), preserving unmanaged user keys and formatting.
+- **Non-Destructive Config Mutation**: `save_snapshot()` parses the config through `load_yaml()` and updates only managed sections (`modelRoles`, `task.agentModelOverrides`, `disabledProviders`) with the nested setter helpers while preserving unmanaged keys; YAML serialization may rewrite formatting and comments.
 - **Atomic File Writing**: Files must be written to sibling hidden temporary files and renamed (`fs::rename`) to prevent partial writes during crashes or interruptions.
 - **Path Sanitization**: Backend helper `display_path()` replaces user home paths with `~/` before returning data across the IPC boundary to avoid leaking local usernames.
 
@@ -127,7 +127,7 @@ bun run tauri build
 ---
 
 ## Runtime & Tooling Preferences
-- **Frontend Package Manager**: `bun` is preferred (`tauri.conf.json` invokes `bun run dev` / `bun run build`), with `npm` as a compatible fallback.
+- **Frontend Package Manager**: `bun` is preferred and required by the Tauri `beforeDevCommand`/`beforeBuildCommand` hooks; `npm` can install dependencies and run frontend-only scripts, but desktop commands still invoke Bun through `tauri.conf.json`.
 - **Frontend Framework**: React 19, TypeScript 5 (Strict Mode, `noEmit: true`), Vite 7.
 - **Backend Toolchain**: Rust 2021 Edition with MSRV `1.77.2`.
 - **Desktop Framework**: Tauri v2 (`tauri` `2.11.3`, `@tauri-apps/cli` `^2.11.4`).
