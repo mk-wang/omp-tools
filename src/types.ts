@@ -1,3 +1,10 @@
+export type ModelCost = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
+
 export type ModelOption = {
   provider: string;
   id: string;
@@ -6,6 +13,26 @@ export type ModelOption = {
   reasoning: boolean;
   thinking: string[];
   input: string[];
+  contextWindow: number | null;
+  maxTokens: number | null;
+  cost: ModelCost | null;
+};
+
+export type FallbackChain = {
+  target: string;
+  selectors: string[];
+};
+
+export type RoutingSettings = {
+  defaultThinkingLevel: string | null;
+  autoThinkingMaxEffort: string | null;
+  advisorEnabled: boolean | null;
+  advisorSyncBacklog: string | null;
+  advisorImmuneTurns: number | null;
+  prewalkEnabled: boolean | null;
+  retryModelFallback: boolean | null;
+  retryFallbackChains: FallbackChain[];
+  retryFallbackRevertPolicy: string | null;
 };
 
 export type AgentDefinitionFile = {
@@ -22,16 +49,11 @@ export type ConfigSnapshot = {
   configExists: boolean;
   modelRoles: Record<string, string>;
   agentModelOverrides: Record<string, string>;
-  disabledProviders: string[];
   models: ModelOption[];
   modelSource: string;
   agentFiles: AgentDefinitionFile[];
+  routingSettings: RoutingSettings;
   warnings: string[];
-};
-
-export type CustomRoleSave = {
-  role: string;
-  selector: string;
 };
 
 export type AgentFileSave = {
@@ -40,14 +62,11 @@ export type AgentFileSave = {
 };
 
 export type SaveRequest = {
-  smol: string;
-  default: string;
-  slow: string;
-  vision: string;
-  advisor: string;
-  customRoles: CustomRoleSave[];
+  modelRoles: Record<string, string>;
+  removedModelRoles: string[];
+  agentModelOverrides: Record<string, string>;
   agentFiles: AgentFileSave[];
-  reviewer: string;
-  securityReviewer: string;
-  disabledProviders: string[];
+  shadowedProviders: string[];
+  routingSettings: RoutingSettings;
+  ompPath?: string | null;
 };

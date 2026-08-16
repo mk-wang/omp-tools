@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { loadSnapshot, saveSnapshot } from "./api";
-import type { ConfigSnapshot, ModelOption, SaveRequest } from "./types";
+import type { ConfigSnapshot, FallbackChain, ModelOption, RoutingSettings, SaveRequest } from "./types";
 import "./styles.css";
 
 type SlotKey =
@@ -8,9 +8,15 @@ type SlotKey =
   | "smol"
   | "slow"
   | "vision"
+  | "plan"
+  | "designer"
+  | "commit"
+  | "tiny"
+  | "task"
   | "advisor"
   | "reviewer"
   | "securityReviewer";
+type ModelRoleKey = Exclude<SlotKey, "reviewer" | "securityReviewer">;
 type SlotValues = Record<SlotKey, string>;
 type Theme = "light" | "dark";
 
@@ -52,6 +58,8 @@ type Preset = {
   customRoleValues: Record<string, string>;
   reviewerFollowsSlow: boolean;
   securityReviewerFollowsSlow: boolean;
+  routingSettings?: RoutingSettings;
+  shadowedProviders?: string[];
   updatedAt: string;
 };
 
@@ -67,7 +75,7 @@ const SLOT_DEFINITIONS: SlotDefinition[] = [
   {
     key: "smol",
     title: "Small",
-    eyebrow: "OMP smol",
+    eyebrow: "快速任务",
     path: "modelRoles.smol",
     description: "快速研究、轻量任务和低成本后台工作。",
     color: "amber"
@@ -81,12 +89,52 @@ const SLOT_DEFINITIONS: SlotDefinition[] = [
     color: "blue"
   },
   {
+    key: "plan",
+    title: "Plan",
+    eyebrow: "架构规划",
+    path: "modelRoles.plan",
+    description: "Plan mode 的架构、边界和实施方案。",
+    color: "violet"
+  },
+  {
+    key: "task",
+    title: "Task",
+    eyebrow: "通用子任务",
+    path: "modelRoles.task",
+    description: "通用 task Agent 的实现与整合工作。",
+    color: "cyan"
+  },
+  {
     key: "vision",
     title: "Vision",
     eyebrow: "视觉输入",
     path: "modelRoles.vision",
     description: "图片、截图和视觉输入任务。",
     color: "indigo"
+  },
+  {
+    key: "designer",
+    title: "Designer",
+    eyebrow: "设计实现",
+    path: "modelRoles.designer",
+    description: "UI/UX、视觉实现和设计审查。",
+    color: "rose"
+  },
+  {
+    key: "commit",
+    title: "Commit",
+    eyebrow: "提交文本",
+    path: "modelRoles.commit",
+    description: "Commit message 与 changelog 生成。",
+    color: "amber"
+  },
+  {
+    key: "tiny",
+    title: "Tiny",
+    eyebrow: "后台轻量",
+    path: "modelRoles.tiny",
+    description: "标题、分类和自动 thinking 等后台小任务。",
+    color: "cyan"
   },
   {
     key: "advisor",
@@ -113,12 +161,40 @@ const SLOT_DEFINITIONS: SlotDefinition[] = [
     color: "red"
   }
 ];
-const AGENT_OVERRIDE_KEYS = new Set<SlotKey>(["reviewer", "securityReviewer"]);
-const MODEL_ROLE_DEFINITIONS = SLOT_DEFINITIONS.filter(definition => !AGENT_OVERRIDE_KEYS.has(definition.key));
-const BUILTIN_AGENT_OVERRIDE_DEFINITIONS = SLOT_DEFINITIONS.filter(
-  definition => AGENT_OVERRIDE_KEYS.has(definition.key)
+const SYSTEM_MODEL_ROLE_IDS: ModelRoleKey[] = [
+  "default",
+  "smol",
+  "slow",
+  "plan",
+  "task",
+  "vision",
+  "designer",
+  "commit",
+  "tiny",
+  "advisor"
+];
+const SYSTEM_MODEL_ROLE_LOOKUP: Record<ModelRoleKey, true> = {
+  default: true,
+  smol: true,
+  slow: true,
+  plan: true,
+  task: true,
+  vision: true,
+  designer: true,
+  commit: true,
+  tiny: true,
+  advisor: true
+};
+const AGENT_OVERRIDE_KEY_LOOKUP: Record<"reviewer" | "securityReviewer", true> = {
+  reviewer: true,
+  securityReviewer: true
+};
+const MODEL_ROLE_DEFINITIONS = SLOT_DEFINITIONS.filter(
+  definition => !Object.hasOwn(AGENT_OVERRIDE_KEY_LOOKUP, definition.key)
 );
-
+const BUILTIN_AGENT_OVERRIDE_DEFINITIONS = SLOT_DEFINITIONS.filter(
+  definition => Object.hasOwn(AGENT_OVERRIDE_KEY_LOOKUP, definition.key)
+);
 
 const EFFORT_LABELS: Record<string, string> = {
   auto: "Auto",
@@ -133,29 +209,36 @@ const EFFORT_LABELS: Record<string, string> = {
 
 const KNOWN_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "off"];
 const PRESETS_STORAGE_KEY = "omp-model-studio.presets";
+const OMP_PATH_STORAGE_KEY = "omp-model-studio.omp-path";
 const THEME_STORAGE_KEY = "omp-model-studio.theme";
-const SYSTEM_MODEL_ROLES = new Set([
-  "default",
-  "smol",
-  "slow",
-  "vision",
-  "plan",
-  "designer",
-  "commit",
-  "tiny",
-  "task",
-  "advisor"
-]);
 const CUSTOM_ROLE_PATTERN = /^[a-z][a-z0-9_-]*$/;
+const SHADOWED_PROVIDERS_STORAGE_KEY = "omp-model-studio.shadowed-providers";
 
 const EMPTY_VALUES: SlotValues = {
   default: "",
   smol: "",
   slow: "",
+  plan: "",
+  task: "",
   vision: "",
+  designer: "",
+  commit: "",
+  tiny: "",
   advisor: "",
   reviewer: "",
   securityReviewer: ""
+};
+
+const EMPTY_ROUTING_SETTINGS: RoutingSettings = {
+  defaultThinkingLevel: null,
+  autoThinkingMaxEffort: null,
+  advisorEnabled: null,
+  advisorSyncBacklog: null,
+  advisorImmuneTurns: null,
+  prewalkEnabled: null,
+  retryModelFallback: null,
+  retryFallbackChains: [],
+  retryFallbackRevertPolicy: null
 };
 
 function readableError(error: unknown): string {
@@ -193,6 +276,68 @@ function recordOfStrings(value: unknown): Record<string, string> {
   );
 }
 
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(
+    value
+      .filter((item): item is string => typeof item === "string")
+      .map(item => item.trim())
+      .filter(Boolean)
+  )];
+}
+
+function readShadowedProviders(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    return stringList(JSON.parse(window.localStorage.getItem(SHADOWED_PROVIDERS_STORAGE_KEY) ?? "[]"));
+  } catch {
+    return [];
+  }
+}
+function cloneRoutingSettings(settings: RoutingSettings): RoutingSettings {
+  return {
+    ...settings,
+    retryFallbackChains: settings.retryFallbackChains.map(chain => ({
+      target: chain.target,
+      selectors: [...chain.selectors]
+    }))
+  };
+}
+
+function parseRoutingSettings(value: unknown): RoutingSettings | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const nullableString = (field: string): string | null =>
+    typeof record[field] === "string" ? record[field] : null;
+  const nullableBoolean = (field: string): boolean | null =>
+    typeof record[field] === "boolean" ? record[field] : null;
+  const nullableNumber = (field: string): number | null =>
+    typeof record[field] === "number" && Number.isFinite(record[field]) ? record[field] : null;
+  const retryFallbackChains = Array.isArray(record.retryFallbackChains)
+    ? record.retryFallbackChains.flatMap(value => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+        const chain = value as Record<string, unknown>;
+        if (typeof chain.target !== "string" || !Array.isArray(chain.selectors)) return [];
+        return [{
+          target: chain.target,
+          selectors: chain.selectors.filter((selector): selector is string => typeof selector === "string")
+        }];
+      })
+    : [];
+  return {
+    defaultThinkingLevel: nullableString("defaultThinkingLevel"),
+    autoThinkingMaxEffort: nullableString("autoThinkingMaxEffort"),
+    advisorEnabled: nullableBoolean("advisorEnabled"),
+    advisorSyncBacklog: nullableString("advisorSyncBacklog"),
+    advisorImmuneTurns: nullableNumber("advisorImmuneTurns"),
+    prewalkEnabled: nullableBoolean("prewalkEnabled"),
+    retryModelFallback: nullableBoolean("retryModelFallback"),
+    retryFallbackChains,
+    retryFallbackRevertPolicy: nullableString("retryFallbackRevertPolicy")
+  };
+}
+
+
 function parsePreset(value: unknown): Preset | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
@@ -202,6 +347,11 @@ function parsePreset(value: unknown): Preset | null {
   if (!Object.hasOwn(customRoleValues, "tester") && storedValues.tester) {
     customRoleValues.tester = storedValues.tester;
   }
+  // Migrate presets written by the older UI; this is WebView-local state, never OMP config.
+  const hasShadowedProviders = Object.hasOwn(record, "shadowedProviders") || Object.hasOwn(record, "disabledProviders");
+  const shadowedProviders = hasShadowedProviders
+    ? stringList(Object.hasOwn(record, "shadowedProviders") ? record.shadowedProviders : record.disabledProviders)
+    : undefined;
   return {
     id: record.id,
     name: record.name,
@@ -209,7 +359,12 @@ function parsePreset(value: unknown): Preset | null {
       default: storedValues.default ?? "",
       smol: storedValues.smol ?? "",
       slow: storedValues.slow ?? "",
+      plan: storedValues.plan ?? "",
+      task: storedValues.task ?? "",
       vision: storedValues.vision ?? "",
+      designer: storedValues.designer ?? "",
+      commit: storedValues.commit ?? "",
+      tiny: storedValues.tiny ?? "",
       advisor: storedValues.advisor ?? "",
       reviewer: storedValues.reviewer ?? "",
       securityReviewer: storedValues.securityReviewer ?? ""
@@ -217,6 +372,8 @@ function parsePreset(value: unknown): Preset | null {
     customRoleValues,
     reviewerFollowsSlow: record.reviewerFollowsSlow !== false,
     securityReviewerFollowsSlow: record.securityReviewerFollowsSlow !== false,
+    routingSettings: parseRoutingSettings(record.routingSettings),
+    shadowedProviders,
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : new Date(0).toISOString()
   };
 }
@@ -269,38 +426,78 @@ function readTheme(): Theme {
   return window.localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
 }
 
+function thinkingOptionsForModel(model: ModelOption | undefined): string[] {
+  if (!model) return ["auto"];
+  const supported = model.thinking.length > 0
+    ? model.thinking
+    : model.reasoning
+      ? KNOWN_EFFORTS
+      : ["off"];
+  return [...new Set(["auto", ...supported])];
+}
+function formatTokenLimit(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.?0+$/, "")}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+  return String(value);
+}
+
+function formatPrice(value: number): string {
+  return value.toFixed(value < 0.1 ? 3 : 2).replace(/\.?0+$/, "");
+}
+
+function ModelMetadata({ model }: { model: ModelOption }) {
+  return (
+    <div className="model-metadata" aria-label={`${model.name} metadata`}>
+      {model.contextWindow !== null && <span title="Context window">Context {formatTokenLimit(model.contextWindow)}</span>}
+      {model.maxTokens !== null && <span title="Maximum output tokens">Output {formatTokenLimit(model.maxTokens)}</span>}
+      {model.input.length > 0 && <span>{model.input.map(item => item[0].toUpperCase() + item.slice(1)).join(" + ")}</span>}
+      {model.cost && (
+        <>
+          <span title="Standard input price per million tokens">In ${formatPrice(model.cost.input)}</span>
+          <span title="Standard output price per million tokens">Out ${formatPrice(model.cost.output)} / 1M</span>
+          <span title="Cache read / cache write price per million tokens">
+            Cache ${formatPrice(model.cost.cacheRead)} / ${formatPrice(model.cost.cacheWrite)}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+
 function ModelPicker({
   value,
   models,
   filter,
-  disabledProviders,
+  shadowedProviders,
   onChange,
   disabled = false
 }: {
   value: string;
   models: ModelOption[];
   filter: string;
-  disabledProviders: string[];
+  shadowedProviders: string[];
   onChange: (value: string) => void;
   disabled?: boolean;
 }) {
   const parsed = splitSelector(value);
   const currentProvider = providerForSelector(value);
-  const disabledProviderSet = new Set(disabledProviders);
+  const shadowedProviderSet = new Set(shadowedProviders);
+  const currentModel = models.find(model => `${model.provider}/${model.id}` === parsed.base);
   const providers = useMemo(() => {
     const names = new Set(
       models
-        .filter(model => !disabledProviderSet.has(model.provider) || model.provider === currentProvider)
+        .filter(model => !shadowedProviderSet.has(model.provider))
         .map(model => model.provider)
     );
     if (currentProvider) names.add(currentProvider);
     return [...names].sort((left, right) => left.localeCompare(right));
-  }, [currentProvider, models, disabledProviders]);
+  }, [currentProvider, models, shadowedProviders]);
 
-  const currentModel = models.find(model => `${model.provider}/${model.id}` === parsed.base);
   const selectedProvider = currentProvider || providers[0] || "";
+  const selectedProviderIsShadowed = shadowedProviderSet.has(selectedProvider);
   const providerModels = models.filter(
-    model => model.provider === selectedProvider && (!disabledProviderSet.has(selectedProvider) || selectedProvider === currentProvider)
+    model => model.provider === selectedProvider && !selectedProviderIsShadowed
   );
   const normalizedFilter = filter.trim().toLowerCase();
   const filteredModels = providerModels.filter(model => {
@@ -310,18 +507,8 @@ function ModelPicker({
   const availableModels = filteredModels.length > 0 ? filteredModels : providerModels;
   const selectedModel = currentModel ?? availableModels[0];
   const selectedBase = parsed.base || selectedModel?.selector || "";
-  const effortOptions = useMemo(() => {
-    const supported = currentModel
-      ? currentModel.thinking.length
-        ? currentModel.thinking
-        : currentModel.reasoning
-          ? KNOWN_EFFORTS
-          : ["off"]
-      : KNOWN_EFFORTS;
-    const options = ["auto", ...supported];
-    if (parsed.effort !== "auto" && !options.includes(parsed.effort)) options.push(parsed.effort);
-    return [...new Set(options)];
-  }, [currentModel, parsed.effort]);
+  const providerHasModels = (provider: string) => models.some(model => model.provider === provider);
+  const effortOptions = useMemo(() => thinkingOptionsForModel(selectedModel), [selectedModel]);
 
   if (parsed.alias) {
     return (
@@ -337,61 +524,412 @@ function ModelPicker({
     );
   }
 
+  const selectModel = (nextModel: ModelOption | undefined, fallbackSelector = "") => {
+    const selector = nextModel?.selector ?? fallbackSelector;
+    const nextEffort = thinkingOptionsForModel(nextModel).includes(parsed.effort)
+      ? parsed.effort
+      : "auto";
+    onChange(withEffort(selector, nextEffort));
+  };
+
   const changeProvider = (provider: string) => {
-    const next = models.find(model => model.provider === provider);
-    onChange(withEffort(next?.selector ?? `${provider}/`, parsed.effort));
+    selectModel(models.find(model => model.provider === provider), `${provider}/`);
   };
 
   return (
-    <div className="picker-grid">
-      <label className="field-group">
-        <span>Provider</span>
-        <select
-          value={selectedProvider}
-          disabled={disabled || providers.length === 0}
-          onChange={event => changeProvider(event.target.value)}
-        >
-          {providers.length === 0 && <option value="">No providers</option>}
-          {providers.map(provider => (
-            <option value={provider} key={provider}>
-              {provider}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="field-group model-field">
-        <span>Model</span>
-        <select
-          value={selectedBase}
-          disabled={disabled || availableModels.length === 0}
-          onChange={event => onChange(withEffort(event.target.value, parsed.effort))}
-        >
-          {availableModels.length === 0 && <option value="">No models</option>}
-          {selectedBase && !availableModels.some(model => model.selector === selectedBase) && (
-            <option value={selectedBase}>{selectedBase.split("/").slice(1).join("/")}</option>
-          )}
-          {availableModels.map(model => (
-            <option value={model.selector} key={model.selector}>
-              {model.id}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="field-group effort-field">
-        <span>Thinking</span>
-        <select
-          value={parsed.effort}
-          disabled={disabled || !selectedBase}
-          onChange={event => onChange(withEffort(selectedBase, event.target.value))}
-        >
-          {effortOptions.map(effort => (
-            <option value={effort} key={effort}>
-              {EFFORT_LABELS[effort] ?? effort}
-            </option>
-          ))}
-        </select>
-      </label>
+    <div className="model-picker">
+      <div className="picker-grid">
+        <label className="field-group">
+          <span>Provider</span>
+          <select
+            value={selectedProvider}
+            disabled={disabled || providers.length === 0}
+            onChange={event => changeProvider(event.target.value)}
+          >
+            {providers.length === 0 && <option value="">No providers</option>}
+            {providers.map(provider => {
+              const isShadowed = shadowedProviderSet.has(provider);
+              const hasModels = providerHasModels(provider);
+              return (
+                <option value={provider} key={provider} disabled={isShadowed || !hasModels}>
+                  {provider}{isShadowed ? " · shadowed" : !hasModels ? " · unavailable" : ""}
+                </option>
+              );
+            })}
+          </select>
+        </label>
+        <label className="field-group model-field">
+          <span>Model</span>
+          <select
+            value={selectedBase}
+            disabled={disabled || availableModels.length === 0 || selectedProviderIsShadowed}
+            onChange={event => selectModel(models.find(model => model.selector === event.target.value), event.target.value)}
+          >
+            {availableModels.length === 0 && <option value="">No models</option>}
+            {selectedBase && !availableModels.some(model => model.selector === selectedBase) && (
+              <option value={selectedBase}>{selectedBase.split("/").slice(1).join("/")}</option>
+            )}
+            {availableModels.map(model => (
+              <option value={model.selector} key={model.selector}>
+                {model.id}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field-group effort-field">
+          <span>Thinking</span>
+          <select
+            value={parsed.effort}
+            disabled={disabled || !selectedBase || selectedProviderIsShadowed || availableModels.length === 0}
+            onChange={event => onChange(withEffort(selectedBase, event.target.value))}
+          >
+            {effortOptions.map(effort => (
+              <option value={effort} key={effort}>
+                {EFFORT_LABELS[effort] ?? effort}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {(parsed.base ? currentModel : selectedModel) && (
+        <ModelMetadata model={(parsed.base ? currentModel : selectedModel)!} />
+      )}
     </div>
+  );
+}
+
+function optionalBooleanFromControl(value: string): boolean | null {
+  if (value === "on") return true;
+  if (value === "off") return false;
+  return null;
+}
+
+function RoutingPolicySection({
+  settings,
+  models,
+  shadowedProviders,
+  roleNames,
+  errors,
+  onChange
+}: {
+  settings: RoutingSettings;
+  models: ModelOption[];
+  shadowedProviders: string[];
+  roleNames: string[];
+  errors: string[];
+  onChange: (settings: RoutingSettings) => void;
+}) {
+  const effectiveThinking = settings.defaultThinkingLevel ?? "high";
+  const effectiveAdvisor = settings.advisorEnabled ?? false;
+  const effectiveFallback = settings.retryModelFallback ?? true;
+  const shadowedProviderSet = new Set(shadowedProviders);
+  const selectableModels = useMemo(
+    () => models.filter(model => !shadowedProviderSet.has(model.provider)),
+    [models, shadowedProviders]
+  );
+  const providers = useMemo(
+    () => [...new Set(selectableModels.map(model => model.provider))].sort((left, right) => left.localeCompare(right)),
+    [selectableModels]
+  );
+  const targetSuggestions = useMemo(
+    () => [
+      ...new Set([
+        ...roleNames,
+        ...selectableModels.map(model => model.selector),
+        ...providers.map(provider => `${provider}/*`)
+      ])
+    ],
+    [providers, roleNames, selectableModels]
+  );
+  const selectorSuggestions = useMemo(
+    () => [
+      ...new Set([
+        ...roleNames.map(role => `@${role}`),
+        ...selectableModels.map(model => model.selector),
+        ...providers.map(provider => `${provider}/*`)
+      ])
+    ],
+    [providers, roleNames, selectableModels]
+  );
+
+  const replaceChain = (index: number, chain: FallbackChain) => {
+    const retryFallbackChains = settings.retryFallbackChains.map((current, currentIndex) =>
+      currentIndex === index ? chain : current
+    );
+    onChange({ ...settings, retryFallbackChains });
+  };
+
+  const moveChainSelector = (chainIndex: number, selectorIndex: number, offset: -1 | 1) => {
+    const chain = settings.retryFallbackChains[chainIndex];
+    const targetIndex = selectorIndex + offset;
+    if (!chain || targetIndex < 0 || targetIndex >= chain.selectors.length) return;
+    const selectors = [...chain.selectors];
+    [selectors[selectorIndex], selectors[targetIndex]] = [selectors[targetIndex], selectors[selectorIndex]];
+    replaceChain(chainIndex, { ...chain, selectors });
+  };
+
+  const addChain = () => {
+    const existingTargets = new Set(settings.retryFallbackChains.map(chain => chain.target));
+    const target = roleNames.find(role => !existingTargets.has(role)) ?? "";
+    onChange({
+      ...settings,
+      retryFallbackChains: [...settings.retryFallbackChains, { target, selectors: [""] }]
+    });
+  };
+
+  return (
+    <section className="routing-section">
+      <div className="custom-role-heading">
+        <div>
+          <span className="section-kicker">ROUTING POLICY</span>
+          <h2>Thinking、Advisor 与故障转移</h2>
+          <p>空值表示继承 OMP 默认；显式 Role thinking 后缀仍优先于全局 thinking。</p>
+        </div>
+      </div>
+
+      <div className="policy-grid">
+        <article className="policy-card">
+          <div className="policy-card-heading">
+            <span>THINKING</span>
+            <code>defaultThinkingLevel</code>
+          </div>
+          <label className="policy-field">
+            <span>Global level</span>
+            <select
+              value={settings.defaultThinkingLevel ?? ""}
+              onChange={event => onChange({
+                ...settings,
+                defaultThinkingLevel: event.target.value || null
+              })}
+            >
+              <option value="">OMP default · High</option>
+              <option value="auto">Auto</option>
+              {KNOWN_EFFORTS.map(effort => (
+                <option value={effort} key={effort}>{EFFORT_LABELS[effort] ?? effort}</option>
+              ))}
+            </select>
+          </label>
+          <label className="policy-field">
+            <span>Auto ceiling</span>
+            <select
+              value={settings.autoThinkingMaxEffort ?? ""}
+              disabled={effectiveThinking !== "auto"}
+              onChange={event => onChange({
+                ...settings,
+                autoThinkingMaxEffort: event.target.value || null
+              })}
+            >
+              <option value="">OMP default · XHigh</option>
+              <option value="xhigh">XHigh</option>
+              <option value="max">Max</option>
+            </select>
+          </label>
+          <p className="policy-effective">Effective global level: <strong>{effectiveThinking}</strong></p>
+        </article>
+
+        <article className="policy-card">
+          <div className="policy-card-heading">
+            <span>RUNTIME</span>
+            <code>advisor / prewalk</code>
+          </div>
+          <label className="policy-field">
+            <span>Advisor</span>
+            <select
+              value={settings.advisorEnabled === null ? "" : settings.advisorEnabled ? "on" : "off"}
+              onChange={event => onChange({
+                ...settings,
+                advisorEnabled: optionalBooleanFromControl(event.target.value)
+              })}
+            >
+              <option value="">OMP default · Off</option>
+              <option value="on">On</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
+          <div className="policy-field-row">
+            <label className="policy-field">
+              <span>Sync backlog</span>
+              <select
+                value={settings.advisorSyncBacklog ?? ""}
+                disabled={!effectiveAdvisor}
+                onChange={event => onChange({
+                  ...settings,
+                  advisorSyncBacklog: event.target.value || null
+                })}
+              >
+                <option value="">OMP default · Off</option>
+                {["off", "1", "3", "5"].map(value => (
+                  <option value={value} key={value}>{value === "off" ? "Off" : `${value} turn${value === "1" ? "" : "s"}`}</option>
+                ))}
+              </select>
+            </label>
+            <label className="policy-field">
+              <span>Immune turns</span>
+              <select
+                value={settings.advisorImmuneTurns ?? ""}
+                disabled={!effectiveAdvisor}
+                onChange={event => onChange({
+                  ...settings,
+                  advisorImmuneTurns: event.target.value ? Number(event.target.value) : null
+                })}
+              >
+                <option value="">OMP default · 3</option>
+                {[0, 1, 2, 3, 4, 5].map(value => <option value={value} key={value}>{value}</option>)}
+              </select>
+            </label>
+          </div>
+          <label className="policy-field">
+            <span>Prewalk</span>
+            <select
+              value={settings.prewalkEnabled === null ? "" : settings.prewalkEnabled ? "on" : "off"}
+              onChange={event => onChange({
+                ...settings,
+                prewalkEnabled: optionalBooleanFromControl(event.target.value)
+              })}
+            >
+              <option value="">OMP default · Off</option>
+              <option value="on">On · hand off to @smol</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
+        </article>
+
+        <article className="policy-card">
+          <div className="policy-card-heading">
+            <span>RETRY</span>
+            <code>retry.modelFallback</code>
+          </div>
+          <label className="policy-field">
+            <span>Model fallback</span>
+            <select
+              value={settings.retryModelFallback === null ? "" : settings.retryModelFallback ? "on" : "off"}
+              onChange={event => onChange({
+                ...settings,
+                retryModelFallback: optionalBooleanFromControl(event.target.value)
+              })}
+            >
+              <option value="">OMP default · On</option>
+              <option value="on">On</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
+          <label className="policy-field">
+            <span>Return to primary</span>
+            <select
+              value={settings.retryFallbackRevertPolicy ?? ""}
+              disabled={!effectiveFallback}
+              onChange={event => onChange({
+                ...settings,
+                retryFallbackRevertPolicy: event.target.value || null
+              })}
+            >
+              <option value="">OMP default · Cooldown expiry</option>
+              <option value="cooldown-expiry">Cooldown expiry</option>
+              <option value="never">Never</option>
+            </select>
+          </label>
+          <p className="policy-effective">
+            {effectiveFallback ? "Configured chains are eligible after retry recovery." : "Fallback chains stay saved but are inactive."}
+          </p>
+        </article>
+      </div>
+
+      <article className={`fallback-card${errors.length ? " invalid" : ""}`}>
+        <div className="fallback-heading">
+          <div>
+            <span>FALLBACK CHAINS</span>
+            <p>Target 可使用 Role、具体模型或 provider wildcard；候选按顺序尝试。</p>
+          </div>
+          <button className="button compact" onClick={addChain}>新增链</button>
+        </div>
+        <datalist id="fallback-target-options">
+          {targetSuggestions.map(value => <option value={value} key={value} />)}
+        </datalist>
+        <datalist id="fallback-selector-options">
+          {selectorSuggestions.map(value => <option value={value} key={value} />)}
+        </datalist>
+        {settings.retryFallbackChains.length > 0 ? (
+          <div className="fallback-list">
+            {settings.retryFallbackChains.map((chain, chainIndex) => (
+              <div className="fallback-chain" key={chainIndex}>
+                <label className="policy-field fallback-target">
+                  <span>Target</span>
+                  <input
+                    list="fallback-target-options"
+                    value={chain.target}
+                    onChange={event => replaceChain(chainIndex, { ...chain, target: event.target.value })}
+                    placeholder="default 或 provider/*"
+                  />
+                </label>
+                <div className="fallback-selectors">
+                  {chain.selectors.map((selector, selectorIndex) => (
+                    <div className="fallback-selector-row" key={selectorIndex}>
+                      <span className="fallback-order">{selectorIndex + 1}</span>
+                      <input
+                        list="fallback-selector-options"
+                        value={selector}
+                        onChange={event => {
+                          const selectors = [...chain.selectors];
+                          selectors[selectorIndex] = event.target.value;
+                          replaceChain(chainIndex, { ...chain, selectors });
+                        }}
+                        placeholder="provider/model[:thinking] 或 @role"
+                        aria-label={`Fallback ${selectorIndex + 1} for ${chain.target || "new target"}`}
+                      />
+                      <button
+                        className="icon-button"
+                        onClick={() => moveChainSelector(chainIndex, selectorIndex, -1)}
+                        disabled={selectorIndex === 0}
+                        aria-label="Move fallback up"
+                      >↑</button>
+                      <button
+                        className="icon-button"
+                        onClick={() => moveChainSelector(chainIndex, selectorIndex, 1)}
+                        disabled={selectorIndex === chain.selectors.length - 1}
+                        aria-label="Move fallback down"
+                      >↓</button>
+                      <button
+                        className="icon-button danger"
+                        onClick={() => replaceChain(chainIndex, {
+                          ...chain,
+                          selectors: chain.selectors.filter((_, index) => index !== selectorIndex)
+                        })}
+                        aria-label="Remove fallback"
+                      >×</button>
+                    </div>
+                  ))}
+                  <button
+                    className="button quiet compact"
+                    onClick={() => replaceChain(chainIndex, {
+                      ...chain,
+                      selectors: [...chain.selectors, ""]
+                    })}
+                  >
+                    添加候选
+                  </button>
+                </div>
+                <button
+                  className="button quiet compact danger"
+                  onClick={() => onChange({
+                    ...settings,
+                    retryFallbackChains: settings.retryFallbackChains.filter((_, index) => index !== chainIndex)
+                  })}
+                >
+                  删除链
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="custom-role-empty">没有配置 fallback chain；OMP 只使用自身的凭据与重试恢复。</div>
+        )}
+        {errors.length > 0 && (
+          <div className="routing-errors">
+            {errors.map(error => <span key={error}>{error}</span>)}
+          </div>
+        )}
+      </article>
+    </section>
   );
 }
 
@@ -400,7 +938,7 @@ function SlotCard({
   value,
   models,
   filter,
-  disabledProviders,
+  shadowedProviders,
   reviewerFollowsSlow,
   securityReviewerFollowsSlow,
   slowValue,
@@ -411,7 +949,7 @@ function SlotCard({
   value: string;
   models: ModelOption[];
   filter: string;
-  disabledProviders: string[];
+  shadowedProviders: string[];
   reviewerFollowsSlow: boolean;
   securityReviewerFollowsSlow: boolean;
   slowValue: string;
@@ -423,7 +961,7 @@ function SlotCard({
   const followsSlow = isReviewer ? reviewerFollowsSlow : isSecurityReviewer ? securityReviewerFollowsSlow : false;
   const effectiveValue = followsSlow ? slowValue : value;
   const effectiveProvider = providerForSelector(effectiveValue);
-  const isInvalid = Boolean(effectiveProvider && disabledProviders.includes(effectiveProvider));
+  const isInvalid = Boolean(effectiveProvider && shadowedProviders.includes(effectiveProvider));
   const followKey = isSecurityReviewer ? "securityReviewer" : "reviewer";
   const isFollowable = isReviewer || isSecurityReviewer;
 
@@ -436,7 +974,7 @@ function SlotCard({
             <div className="slot-title-line">
               <h2>{definition.title}</h2>
               <span className="eyebrow">{definition.eyebrow}</span>
-              {definition.path && !AGENT_OVERRIDE_KEYS.has(definition.key) && (
+              {definition.path && !Object.hasOwn(AGENT_OVERRIDE_KEY_LOOKUP, definition.key) && (
                 <code className="config-path">{definition.path}</code>
               )}
             </div>
@@ -470,7 +1008,7 @@ function SlotCard({
           value={value}
           models={models}
           filter={filter}
-          disabledProviders={disabledProviders}
+          shadowedProviders={shadowedProviders}
           onChange={onChange}
         />
       )}
@@ -483,17 +1021,21 @@ function CustomRoleCard({
   customRole,
   models,
   filter,
-  disabledProviders,
-  onChange
+  shadowedProviders,
+  deletePending,
+  onChange,
+  onDelete
 }: {
   customRole: CustomRole;
   models: ModelOption[];
   filter: string;
-  disabledProviders: string[];
+  shadowedProviders: string[];
+  deletePending: boolean;
   onChange: (value: string) => void;
+  onDelete: () => void;
 }) {
   const provider = providerForSelector(customRole.value);
-  const isInvalid = Boolean(provider && disabledProviders.includes(provider));
+  const isInvalid = Boolean(provider && shadowedProviders.includes(provider));
   return (
     <article className={`slot-card cyan custom-role-card${isInvalid ? " invalid" : ""}`}>
       <div className="slot-header">
@@ -508,13 +1050,18 @@ function CustomRoleCard({
             <p>只定义模型与 thinking 路由；不创建或绑定 Agent。</p>
           </div>
         </div>
-        {isInvalid && <span className="invalid-badge">非法</span>}
+        <div className="custom-role-actions">
+          {isInvalid && <span className="invalid-badge">非法</span>}
+          <button className="button quiet compact danger" onClick={onDelete}>
+            {deletePending ? "确认移除" : "移除"}
+          </button>
+        </div>
       </div>
       <ModelPicker
         value={customRole.value}
         models={models}
         filter={filter}
-        disabledProviders={disabledProviders}
+        shadowedProviders={shadowedProviders}
         onChange={onChange}
       />
     </article>
@@ -554,7 +1101,7 @@ function CustomRoleModal({
   editor,
   models,
   filter,
-  disabledProviders,
+  shadowedProviders,
   existingRoles,
   onChange,
   onCancel,
@@ -563,7 +1110,7 @@ function CustomRoleModal({
   editor: CustomRoleEditor;
   models: ModelOption[];
   filter: string;
-  disabledProviders: string[];
+  shadowedProviders: string[];
   existingRoles: string[];
   onChange: (editor: CustomRoleEditor) => void;
   onCancel: () => void;
@@ -573,7 +1120,7 @@ function CustomRoleModal({
     ? "请输入 Role key。"
     : !CUSTOM_ROLE_PATTERN.test(editor.role)
       ? "Role key 需以小写字母开头，只能包含小写字母、数字、-、_。"
-      : SYSTEM_MODEL_ROLES.has(editor.role)
+      : Object.hasOwn(SYSTEM_MODEL_ROLE_LOOKUP, editor.role)
         ? "该名称属于系统 Role。"
         : existingRoles.includes(editor.role)
           ? "该自定义 Role 已存在。"
@@ -612,7 +1159,7 @@ function CustomRoleModal({
               value={editor.value}
               models={models}
               filter={filter}
-              disabledProviders={disabledProviders}
+              shadowedProviders={shadowedProviders}
               onChange={value => onChange({ ...editor, value })}
             />
           </div>
@@ -769,12 +1316,22 @@ export default function App() {
   const [values, setValues] = useState<SlotValues>(EMPTY_VALUES);
   const [customRoles, setCustomRoles] = useState<CustomRole[]>([]);
   const [roleEditor, setRoleEditor] = useState<CustomRoleEditor | null>(null);
+  const [removedModelRoles, setRemovedModelRoles] = useState<string[]>([]);
+  const [pendingDeleteCustomRole, setPendingDeleteCustomRole] = useState("");
   const [customAgents, setCustomAgents] = useState<CustomAgent[]>([]);
   const [agentEditor, setAgentEditor] = useState<AgentEditor | null>(null);
   const [reviewerFollowsSlow, setReviewerFollowsSlow] = useState(true);
   const [securityReviewerFollowsSlow, setSecurityReviewerFollowsSlow] = useState(true);
-  const [disabledProviders, setDisabledProviders] = useState<string[]>([]);
+  const [shadowedProviders, setShadowedProviders] = useState<string[]>(readShadowedProviders);
+  const [routingSettings, setRoutingSettings] = useState<RoutingSettings>(
+    () => cloneRoutingSettings(EMPTY_ROUTING_SETTINGS)
+  );
   const [filter, setFilter] = useState("");
+  const [customOmpPath, setCustomOmpPath] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem(OMP_PATH_STORAGE_KEY) ?? "";
+  });
+  const [customOmpPathDraft, setCustomOmpPathDraft] = useState(customOmpPath);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -795,6 +1352,14 @@ export default function App() {
     }
   }, [theme]);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SHADOWED_PROVIDERS_STORAGE_KEY, JSON.stringify(shadowedProviders));
+    } catch {
+      // Shadow state still applies for the current session when storage is unavailable.
+    }
+  }, [shadowedProviders]);
+
   const applySnapshot = (next: ConfigSnapshot) => {
     const rawReviewer = next.agentModelOverrides.reviewer ?? "";
     const rawSecurityReviewer = next.agentModelOverrides["security-reviewer"] ?? "";
@@ -806,13 +1371,18 @@ export default function App() {
       default: next.modelRoles.default ?? "",
       smol: next.modelRoles.smol ?? "",
       slow: next.modelRoles.slow ?? "",
+      plan: next.modelRoles.plan ?? "",
+      task: next.modelRoles.task ?? "",
       vision: next.modelRoles.vision ?? "",
+      designer: next.modelRoles.designer ?? "",
+      commit: next.modelRoles.commit ?? "",
+      tiny: next.modelRoles.tiny ?? "",
       advisor: next.modelRoles.advisor ?? "",
       reviewer: followsSlow ? next.modelRoles.slow ?? "" : rawReviewer,
       securityReviewer: securityFollowsSlow ? next.modelRoles.slow ?? "" : rawSecurityReviewer
     });
     const nextCustomRoles = Object.entries(next.modelRoles)
-      .filter(([role]) => !SYSTEM_MODEL_ROLES.has(role))
+      .filter(([role]) => !Object.hasOwn(SYSTEM_MODEL_ROLE_LOOKUP, role))
       .map(([role, value]) => ({ role, value }))
       .sort((left, right) => left.role.localeCompare(right.role));
     setCustomRoles(nextCustomRoles);
@@ -826,17 +1396,29 @@ export default function App() {
       dirty: false
     })));
     setRoleEditor(null);
+    setRemovedModelRoles([]);
+    setPendingDeleteCustomRole("");
     setAgentEditor(null);
-    setDisabledProviders([...next.disabledProviders]);
+    setRoutingSettings(cloneRoutingSettings(next.routingSettings));
     setSnapshot(next);
     setSaved(false);
   };
 
-  const refresh = async () => {
+  const refresh = async (pathToTry?: string) => {
+    const targetPath = typeof pathToTry === "string" ? pathToTry : customOmpPath;
     setLoading(true);
     setError("");
     try {
-      applySnapshot(await loadSnapshot());
+      const next = await loadSnapshot(targetPath.trim() || undefined);
+      applySnapshot(next);
+      if (targetPath.trim()) {
+        setCustomOmpPath(targetPath.trim());
+        try {
+          window.localStorage.setItem(OMP_PATH_STORAGE_KEY, targetPath.trim());
+        } catch {
+          // LocalStorage fallback
+        }
+      }
     } catch (loadError) {
       setError(readableError(loadError));
     } finally {
@@ -847,11 +1429,10 @@ export default function App() {
   useEffect(() => {
     void refresh();
   }, []);
-
   const providerNames = useMemo(() => {
-    const names = new Set([...(snapshot?.models.map(model => model.provider) ?? []), ...disabledProviders]);
+    const names = new Set(snapshot?.models.map(model => model.provider) ?? []);
     return [...names].sort((left, right) => left.localeCompare(right));
-  }, [disabledProviders, snapshot]);
+  }, [snapshot]);
 
   const selectedModelSlots = useMemo(() => {
     const fixedAssignments = SLOT_DEFINITIONS.map(definition => {
@@ -869,30 +1450,82 @@ export default function App() {
       value: customRole.value,
       base: splitSelector(customRole.value).base
     }));
-    return [...fixedAssignments, ...customAssignments].filter(item => item.base && !item.base.startsWith("@"));
-  }, [customRoles, reviewerFollowsSlow, securityReviewerFollowsSlow, values]);
-  const invalidSelections = selectedModelSlots.filter(item => disabledProviders.includes(providerForSelector(item.value)));
+    const fallbackAssignments = routingSettings.retryFallbackChains.flatMap(chain =>
+      chain.selectors.map((selector, index) => ({
+        label: `Fallback ${chain.target || "new"} ${index + 1}`,
+        value: selector,
+        base: splitSelector(selector).base
+      }))
+    );
+    return [...fixedAssignments, ...customAssignments, ...fallbackAssignments]
+      .filter(item => item.base && !item.base.startsWith("@"));
+  }, [customRoles, reviewerFollowsSlow, routingSettings.retryFallbackChains, securityReviewerFollowsSlow, values]);
+  const invalidSelections = selectedModelSlots.filter(item => shadowedProviders.includes(providerForSelector(item.value)));
   const hasInvalidSelections = invalidSelections.length > 0;
   const invalidCustomRoles = customRoles.filter(customRole => !customRole.value.trim());
   const invalidAgents = customAgents.filter(agent => Boolean(validateAgentMarkdown(agent.agentMarkdown)));
-  const hasApplyErrors = hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgents.length > 0;
+  const routingErrors = useMemo(() => {
+    const errors: string[] = [];
+    const targets = new Set<string>();
+    const roleAssignments = new Map<string, string>([
+      ...SYSTEM_MODEL_ROLE_IDS.map(role => [role, values[role]] as [string, string]),
+      ...customRoles.map(role => [role.role, role.value] as [string, string])
+    ]);
+    routingSettings.retryFallbackChains.forEach((chain, chainIndex) => {
+      const target = chain.target.trim();
+      if (!target) errors.push(`Fallback chain ${chainIndex + 1} 缺少 target。`);
+      else if (targets.has(target)) errors.push(`Fallback target “${target}”重复。`);
+      else targets.add(target);
+      if (chain.selectors.length === 0) {
+        errors.push(`Fallback target “${target || chainIndex + 1}”至少需要一个候选模型。`);
+        return;
+      }
+      const selectors = new Set<string>();
+      chain.selectors.forEach((rawSelector, selectorIndex) => {
+        const selector = rawSelector.trim();
+        if (!selector) {
+          errors.push(`Fallback target “${target || chainIndex + 1}”的第 ${selectorIndex + 1} 个候选为空。`);
+          return;
+        }
+        if (selectors.has(selector)) {
+          errors.push(`Fallback target “${target}”重复使用 “${selector}”。`);
+        }
+        selectors.add(selector);
+        if (selector === target) errors.push(`Fallback target “${target}”不能回退到自身。`);
+        const primary = roleAssignments.get(target);
+        if (primary && splitSelector(primary).base === splitSelector(selector).base) {
+          errors.push(`Fallback target “${target}”不能回退到当前主模型。`);
+        }
+        const provider = providerForSelector(selector);
+        if (provider && shadowedProviders.includes(provider)) {
+          errors.push(`Fallback target “${target}”使用了 shadowed provider “${provider}”。`);
+        }
+      });
+    });
+    return errors;
+  }, [customRoles, routingSettings.retryFallbackChains, shadowedProviders, values]);
+  const hasApplyErrors =
+    hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgents.length > 0 || routingErrors.length > 0;
+  const hasPresetErrors = hasInvalidSelections || invalidCustomRoles.length > 0 || routingErrors.length > 0;
+
 
 
   const catalogModels = useMemo(() => {
     const normalizedFilter = filter.trim().toLowerCase();
     return (snapshot?.models ?? []).filter(model => {
       const matches = !normalizedFilter || `${model.provider} ${model.id} ${model.name}`.toLowerCase().includes(normalizedFilter);
-      return matches && !disabledProviders.includes(model.provider);
+      return matches && !shadowedProviders.includes(model.provider);
     });
-  }, [filter, disabledProviders, snapshot]);
-  const agentRoleOptions = useMemo(() => {
+  }, [filter, shadowedProviders, snapshot]);
+  const roleNames = useMemo(() => {
     const roles = new Set([
-      ...SYSTEM_MODEL_ROLES,
+      ...SYSTEM_MODEL_ROLE_IDS,
       ...Object.keys(snapshot?.modelRoles ?? {}),
       ...customRoles.map(customRole => customRole.role)
     ]);
-    return [...roles].sort((left, right) => left.localeCompare(right)).map(role => `@${role}`);
+    return [...roles].sort((left, right) => left.localeCompare(right));
   }, [customRoles, snapshot]);
+  const agentRoleOptions = useMemo(() => roleNames.map(role => `@${role}`), [roleNames]);
 
   const emptyRoleSlots =
     MODEL_ROLE_DEFINITIONS.filter(definition => !values[definition.key]).length
@@ -902,6 +1535,11 @@ export default function App() {
     setSaved(false);
     setValues(current => ({ ...current, [key]: value }));
   };
+  const updateRoutingSettings = (next: RoutingSettings) => {
+    setSaved(false);
+    setRoutingSettings(cloneRoutingSettings(next));
+  };
+
 
   const updateCustomRoleValue = (role: string, value: string) => {
     setSaved(false);
@@ -909,9 +1547,46 @@ export default function App() {
       current.map(customRole => customRole.role === role ? { ...customRole, value } : customRole)
     );
   };
+  const removeCustomRole = (role: string) => {
+    if (pendingDeleteCustomRole !== role) {
+      setPendingDeleteCustomRole(role);
+      return;
+    }
+    const alias = `@${role}`;
+    const references = [
+      ...SYSTEM_MODEL_ROLE_IDS
+        .filter(systemRole => values[systemRole].trim() === alias)
+        .map(systemRole => `modelRoles.${systemRole}`),
+      ...customRoles
+        .filter(customRole => customRole.role !== role && customRole.value.trim() === alias)
+        .map(customRole => `modelRoles.${customRole.role}`),
+      ...customAgents
+        .filter(agent => agent.model.trim() === alias)
+        .map(agent => `Agent ${agent.name}`),
+      ...routingSettings.retryFallbackChains.flatMap(chain => [
+        ...(chain.target.trim() === role ? [`fallback target ${role}`] : []),
+        ...chain.selectors
+          .filter(selector => selector.trim() === alias)
+          .map(() => `fallback candidate ${alias}`)
+      ])
+    ];
+    if (references.length > 0) {
+      setPendingDeleteCustomRole("");
+      setError(`不能移除 Role “${role}”；仍被 ${references.join("、")} 引用。`);
+      return;
+    }
+
+    setCustomRoles(current => current.filter(customRole => customRole.role !== role));
+    if (snapshot && Object.hasOwn(snapshot.modelRoles, role)) {
+      setRemovedModelRoles(current => current.includes(role) ? current : [...current, role]);
+    }
+    setPendingDeleteCustomRole("");
+    setSaved(false);
+  };
+
 
   const startCustomRole = () => {
-    const firstModel = catalogModels[0]?.selector ?? snapshot?.models[0]?.selector ?? "";
+    const firstModel = catalogModels[0]?.selector ?? "";
     setRoleEditor({ role: "", value: firstModel });
   };
 
@@ -919,13 +1594,15 @@ export default function App() {
     if (
       !roleEditor
       || !CUSTOM_ROLE_PATTERN.test(roleEditor.role)
-      || SYSTEM_MODEL_ROLES.has(roleEditor.role)
+      || Object.hasOwn(SYSTEM_MODEL_ROLE_LOOKUP, roleEditor.role)
       || !roleEditor.value.trim()
     ) return;
     setCustomRoles(current => {
       if (current.some(item => item.role === roleEditor.role)) return current;
       return [...current, roleEditor].sort((left, right) => left.role.localeCompare(right.role));
     });
+    setRemovedModelRoles(current => current.filter(role => role !== roleEditor.role));
+    setPendingDeleteCustomRole("");
     setRoleEditor(null);
     setSaved(false);
   };
@@ -982,10 +1659,10 @@ export default function App() {
     if (follow) setValues(current => ({ ...current, [key]: current.slow }));
   };
 
-  const toggleProvider = (provider: string, disable: boolean) => {
+  const toggleProvider = (provider: string, shadow: boolean) => {
     setSaved(false);
-    setDisabledProviders(current => {
-      if (disable) return current.includes(provider) ? current : [...current, provider];
+    setShadowedProviders(current => {
+      if (shadow) return current.includes(provider) ? current : [...current, provider].sort((left, right) => left.localeCompare(right));
       return current.filter(item => item !== provider);
     });
   };
@@ -1003,6 +1680,8 @@ export default function App() {
     setValues({ ...EMPTY_VALUES, ...preset.values });
     setReviewerFollowsSlow(preset.reviewerFollowsSlow);
     setSecurityReviewerFollowsSlow(preset.securityReviewerFollowsSlow);
+    if (preset.routingSettings) setRoutingSettings(cloneRoutingSettings(preset.routingSettings));
+    if (preset.shadowedProviders) setShadowedProviders([...preset.shadowedProviders]);
     const existingRoles = new Set(customRoles.map(customRole => customRole.role));
     const skippedRoles = Object.keys(preset.customRoleValues).filter(role => !existingRoles.has(role));
     setCustomRoles(current =>
@@ -1019,7 +1698,7 @@ export default function App() {
     setPresetMessage(
       skippedRoles.length
         ? `已载入：“${preset.name}”；当前没有这些自定义 Role：${skippedRoles.join("、")}。`
-        : `已载入模型草稿：“${preset.name}”。`
+        : `已载入路由草稿：“${preset.name}”。`
     );
   };
 
@@ -1029,8 +1708,8 @@ export default function App() {
       setPresetMessage("先选择一个预设。");
       return;
     }
-    if (hasInvalidSelections) {
-      setPresetMessage("存在非法选择，修复后才能保存。");
+    if (hasPresetErrors) {
+      setPresetMessage("存在非法路由选择，修复后才能保存。");
       return;
     }
     const customRoleValues = Object.fromEntries(customRoles.map(customRole => [customRole.role, customRole.value]));
@@ -1040,6 +1719,8 @@ export default function App() {
       customRoleValues,
       reviewerFollowsSlow,
       securityReviewerFollowsSlow,
+      routingSettings: cloneRoutingSettings(routingSettings),
+      shadowedProviders: [...shadowedProviders],
       updatedAt: new Date().toISOString()
     };
     persistPresetList(presets.map(preset => (preset.id === selected.id ? nextPreset : preset)));
@@ -1048,8 +1729,8 @@ export default function App() {
   };
 
   const savePresetAs = () => {
-    if (hasInvalidSelections) {
-      setPresetMessage("存在非法选择，修复后才能保存。");
+    if (hasPresetErrors) {
+      setPresetMessage("存在非法路由选择，修复后才能保存。");
       return;
     }
     const name = presetName.trim();
@@ -1065,6 +1746,8 @@ export default function App() {
       customRoleValues,
       reviewerFollowsSlow,
       securityReviewerFollowsSlow,
+      routingSettings: cloneRoutingSettings(routingSettings),
+      shadowedProviders: [...shadowedProviders],
       updatedAt: new Date().toISOString()
     };
     persistPresetList([...presets, nextPreset]);
@@ -1089,21 +1772,21 @@ export default function App() {
   };
 
   const request: SaveRequest = {
-    smol: values.smol,
-    default: values.default,
-    slow: values.slow,
-    vision: values.vision,
-    advisor: values.advisor,
-    customRoles: customRoles.map(customRole => ({
-      role: customRole.role,
-      selector: customRole.value
-    })),
+    modelRoles: Object.fromEntries([
+      ...SYSTEM_MODEL_ROLE_IDS.map(role => [role, values[role]]),
+      ...customRoles.map(customRole => [customRole.role, customRole.value])
+    ]),
+    removedModelRoles: [...removedModelRoles],
+    agentModelOverrides: {
+      reviewer: reviewerFollowsSlow ? "" : values.reviewer,
+      "security-reviewer": securityReviewerFollowsSlow ? "" : values.securityReviewer
+    },
     agentFiles: customAgents
       .filter(agent => agent.dirty)
       .map(agent => ({ fileName: agent.fileName, agentMarkdown: agent.agentMarkdown })),
-    reviewer: reviewerFollowsSlow ? "" : values.reviewer,
-    securityReviewer: securityReviewerFollowsSlow ? "" : values.securityReviewer,
-    disabledProviders
+    shadowedProviders,
+    routingSettings: cloneRoutingSettings(routingSettings),
+    ompPath: customOmpPath.trim() || null
   };
   const deletePending = Boolean(selectedPresetId) && pendingDeletePresetId === selectedPresetId;
 
@@ -1111,11 +1794,13 @@ export default function App() {
   const applyConfig = async () => {
     if (hasApplyErrors) {
       setError(
-        invalidCustomRoles.length
-          ? "自定义模型 Role 缺少有效模型。"
-          : invalidAgents.length
-            ? "存在无效 Agent Markdown。请打开对应 Agent 修复。"
-            : "存在非法选择：已禁用 provider 不能应用。请勾选 Use 或更换 Model。"
+        routingErrors.length
+          ? routingErrors[0]
+          : invalidCustomRoles.length
+            ? "自定义模型 Role 缺少有效模型。"
+            : invalidAgents.length
+              ? "存在无效 Agent Markdown。请打开对应 Agent 修复。"
+          : "存在非法选择：shadowed provider 不能应用。请勾选 Use 或更换 Model。"
       );
       return;
     }
@@ -1147,12 +1832,25 @@ export default function App() {
     return (
       <div className="error-screen">
         <div className="error-mark">!</div>
-        <h1>无法打开 OMP 配置</h1>
+        <h1>无法读取 OMP 模型目录</h1>
         <p>{error}</p>
-        <p className="muted">请确认已安装 omp，并通过 Tauri 启动此应用。</p>
-        <button className="button primary" onClick={() => void refresh()}>
-          重新读取
-        </button>
+        <p className="muted">请指定本机的 omp 可执行文件完整路径（如 ~/.bun/bin/omp 或 /usr/local/bin/omp）并重新读取：</p>
+        <div className="path-recovery-form">
+          <input
+            type="text"
+            className="path-input"
+            value={customOmpPathDraft}
+            onChange={event => setCustomOmpPathDraft(event.target.value)}
+            placeholder="输入 omp 完整路径，例如：~/.bun/bin/omp"
+            aria-label="omp 可执行文件完整路径"
+          />
+          <button
+            className="button primary"
+            onClick={() => void refresh(customOmpPathDraft)}
+          >
+            使用指定路径重新读取
+          </button>
+        </div>
       </div>
     );
   }
@@ -1182,7 +1880,7 @@ export default function App() {
             className="button"
             onClick={() => void applyConfig()}
             disabled={saving || hasApplyErrors}
-            title={hasApplyErrors ? "存在非法模型或无效 Agent Markdown" : "应用模型与自定义 Agent 配置"}
+            title={hasApplyErrors ? "存在非法模型、路由策略或 Agent Markdown" : "应用模型与 Agent 路由配置"}
           >
             {saving ? "Applying…" : saved ? "Applied" : hasApplyErrors ? "修复配置" : "Apply"}
           </button>
@@ -1209,7 +1907,7 @@ export default function App() {
               <span>PRESETS</span>
               <strong>{presets.length}</strong>
             </div>
-            <p className="preset-subtitle">只保存 Role 的模型组合，不保存 Agent Markdown</p>
+            <p className="preset-subtitle">保存 Role、路由策略和 shadow provider 状态；不复制 Agent Markdown</p>
 
             {presets.length > 0 && (
               <label className="preset-field">
@@ -1249,14 +1947,14 @@ export default function App() {
               <button
                 className="button compact"
                 onClick={savePresetOverride}
-                disabled={!selectedPresetId || hasInvalidSelections}
+                disabled={!selectedPresetId || hasPresetErrors}
               >
                 Save
               </button>
               <button
                 className="button compact"
                 onClick={savePresetAs}
-                disabled={hasInvalidSelections || !presetName.trim()}
+                disabled={hasPresetErrors || !presetName.trim()}
               >
                 Save as
               </button>
@@ -1271,36 +1969,36 @@ export default function App() {
             </div>
 
             <p className={`preset-status${presetMessage ? " has-message" : ""}`}>
-              {presetMessage || "选择预设自动载入模型；Save 覆盖，Save as 新建。Markdown 始终保持独立。"}
+              {presetMessage || "选择预设载入完整路由草稿；Save 覆盖，Save as 新建。Agent Markdown 始终独立。"}
             </p>
           </section>
 
           <section className="provider-card">
             <div className="catalog-heading"><span>PROVIDER LIST</span><strong>{providerNames.length}</strong></div>
-            <p className="provider-help">只有勾选 Use 的 provider 才能在新的 Model 选择中使用；已选模型仍会保留。</p>
+            <p className="provider-help">列表来自 OMP 当前可用模型；取消 Use 只在本应用中 shadow provider，Apply 仍会拒绝使用其模型的路由。</p>
             <div className="provider-key">
               <span><i className="key-mark used-mark" /> Used by roles</span>
-              <span><i className="key-mark disabled-mark" /> Disabled</span>
+              <span><i className="key-mark shadowed-mark" /> Shadowed locally</span>
             </div>
             <div className="provider-list">
               {providerNames.map(provider => {
-                const isDisabled = disabledProviders.includes(provider);
+                const isShadowed = shadowedProviders.includes(provider);
                 const selected = selectedModelSlots.filter(item => providerForSelector(item.value) === provider);
-                const isInvalid = selected.length > 0 && isDisabled;
+                const isInvalid = selected.length > 0 && isShadowed;
                 return (
-                  <div className={`provider-row ${isDisabled ? "is-disabled" : ""} ${isInvalid ? "is-invalid" : ""}`} key={provider}>
+                  <div className={`provider-row ${isShadowed ? "is-shadowed" : ""} ${isInvalid ? "is-invalid" : ""}`} key={provider}>
                     <span className="provider-name">{provider}</span>
                     {selected.length ? (
                       <span className="provider-selected">Used · {selected.length}</span>
                     ) : (
-                      <span className="provider-state">{isDisabled ? "disabled" : "available"}</span>
+                      <span className="provider-state">{isShadowed ? "shadowed" : "available"}</span>
                     )}
                     <label className="provider-use-control">
                       <input
                         type="checkbox"
-                        checked={!isDisabled}
-                        onChange={event => toggleProvider(provider, !event.target.checked)}
-                        aria-label={`${isDisabled ? "Enable" : "Disable"} ${provider}`}
+                        checked={!isShadowed}
+                        onChange={event => toggleProvider(provider, !event.currentTarget.checked)}
+                        aria-label={`${isShadowed ? "Unshadow" : "Shadow"} ${provider}`}
                       />
                       <span>Use</span>
                     </label>
@@ -1326,13 +2024,17 @@ export default function App() {
                   <div className={`catalog-model-row ${selected.length ? "is-selected" : ""}`} key={model.selector}>
                     <span className="model-status" />
                     <span className="model-label"><strong>{model.provider}</strong>/{model.id}</span>
+                    <span className="catalog-model-meta">
+                      {model.contextWindow !== null ? formatTokenLimit(model.contextWindow) : "—"}
+                      {model.cost ? ` · $${formatPrice(model.cost.input)}/$${formatPrice(model.cost.output)}` : ""}
+                    </span>
                     {selected.length > 0 && <span className="model-selected-badge">{selected.map(item => item.label).join(" · ")}</span>}
                   </div>
                 );
               })}
               {catalogModels.length === 0 && <div className="empty-state">当前筛选没有可见模型。</div>}
             </div>
-            <p>已选模型高亮显示；已禁用 provider 的模型不在列表中。</p>
+            <p>已选模型高亮显示；shadowed provider 的模型不在列表中。</p>
           </section>
 
           {snapshot?.warnings.map(warning => <div className="warning-box" key={warning}>{warning}</div>)}
@@ -1358,7 +2060,7 @@ export default function App() {
                 value={values[definition.key]}
                 models={snapshot?.models ?? []}
                 filter={filter}
-                disabledProviders={disabledProviders}
+                shadowedProviders={shadowedProviders}
                 reviewerFollowsSlow={reviewerFollowsSlow}
                 securityReviewerFollowsSlow={securityReviewerFollowsSlow}
                 slowValue={values.slow}
@@ -1367,6 +2069,15 @@ export default function App() {
               />
             ))}
           </div>
+          <RoutingPolicySection
+            settings={routingSettings}
+            models={snapshot?.models ?? []}
+            shadowedProviders={shadowedProviders}
+            roleNames={roleNames}
+            errors={routingErrors}
+            onChange={updateRoutingSettings}
+          />
+
 
 
           <section className="agent-override-section">
@@ -1385,7 +2096,7 @@ export default function App() {
                   value={values[definition.key]}
                   models={snapshot?.models ?? []}
                   filter={filter}
-                  disabledProviders={disabledProviders}
+                  shadowedProviders={shadowedProviders}
                   reviewerFollowsSlow={reviewerFollowsSlow}
                   securityReviewerFollowsSlow={securityReviewerFollowsSlow}
                   slowValue={values.slow}
@@ -1412,8 +2123,10 @@ export default function App() {
                     customRole={customRole}
                     models={snapshot?.models ?? []}
                     filter={filter}
-                    disabledProviders={disabledProviders}
+                    shadowedProviders={shadowedProviders}
+                    deletePending={pendingDeleteCustomRole === customRole.role}
                     onChange={value => updateCustomRoleValue(customRole.role, value)}
+                    onDelete={() => removeCustomRole(customRole.role)}
                   />
                 ))}
               </div>
@@ -1456,7 +2169,7 @@ export default function App() {
             <div className="bottom-note">
               <span className="info-icon">i</span>
               <span>
-                预设只切换模型。Apply 会写入 modelRoles 和已编辑的 Agent 文件；Skill 不属于本工具的配置范围。
+                预设保存模型与路由草稿。Apply 会写入 modelRoles、routing policy 和已编辑的 Agent 文件；Skill 不属于本工具范围。
               </span>
             </div>
           </div>
@@ -1468,7 +2181,7 @@ export default function App() {
           editor={roleEditor}
           models={snapshot?.models ?? []}
           filter={filter}
-          disabledProviders={disabledProviders}
+          shadowedProviders={shadowedProviders}
           existingRoles={customRoles.map(customRole => customRole.role)}
           onChange={setRoleEditor}
           onCancel={() => setRoleEditor(null)}

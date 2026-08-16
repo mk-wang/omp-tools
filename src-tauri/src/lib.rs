@@ -9,9 +9,24 @@ use std::{
 };
 
 const THINKING_LEVELS: [&str; 7] = ["minimal", "low", "medium", "high", "xhigh", "max", "off"];
+const CONFIGURED_THINKING_LEVELS: [&str; 8] = [
+    "auto", "minimal", "low", "medium", "high", "xhigh", "max", "off",
+];
+const ADVISOR_SYNC_BACKLOGS: [&str; 4] = ["off", "1", "3", "5"];
+const FALLBACK_REVERT_POLICIES: [&str; 2] = ["cooldown-expiry", "never"];
+const AUTO_THINKING_MAX_EFFORTS: [&str; 2] = ["xhigh", "max"];
 const SYSTEM_MODEL_ROLES: [&str; 10] = [
     "default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor",
 ];
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCost {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +38,9 @@ struct ModelOption {
     reasoning: bool,
     thinking: Vec<String>,
     input: Vec<String>,
+    context_window: Option<u64>,
+    max_tokens: Option<u64>,
+    cost: Option<ModelCost>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +54,27 @@ struct AgentDefinitionFile {
     content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FallbackChain {
+    target: String,
+    selectors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingSettings {
+    default_thinking_level: Option<String>,
+    auto_thinking_max_effort: Option<String>,
+    advisor_enabled: Option<bool>,
+    advisor_sync_backlog: Option<String>,
+    advisor_immune_turns: Option<u64>,
+    prewalk_enabled: Option<bool>,
+    retry_model_fallback: Option<bool>,
+    retry_fallback_chains: Vec<FallbackChain>,
+    retry_fallback_revert_policy: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigSnapshot {
@@ -43,18 +82,11 @@ struct ConfigSnapshot {
     config_exists: bool,
     model_roles: BTreeMap<String, String>,
     agent_model_overrides: BTreeMap<String, String>,
-    disabled_providers: Vec<String>,
     models: Vec<ModelOption>,
     model_source: String,
     agent_files: Vec<AgentDefinitionFile>,
+    routing_settings: RoutingSettings,
     warnings: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CustomRoleSave {
-    role: String,
-    selector: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,18 +99,14 @@ struct AgentFileSave {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveRequest {
-    smol: String,
-    default: String,
-    slow: String,
-    vision: String,
-    advisor: String,
-    custom_roles: Vec<CustomRoleSave>,
+    model_roles: BTreeMap<String, String>,
+    removed_model_roles: Vec<String>,
+    agent_model_overrides: BTreeMap<String, String>,
     agent_files: Vec<AgentFileSave>,
-    reviewer: String,
-    security_reviewer: String,
-    disabled_providers: Vec<String>,
+    shadowed_providers: Vec<String>,
+    routing_settings: RoutingSettings,
+    omp_path: Option<String>,
 }
-
 fn home_dir() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -261,6 +289,43 @@ fn string_list(value: Option<&YamlValue>) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+fn nested_value<'a>(root: &'a YamlValue, path: &[&str]) -> Option<&'a YamlValue> {
+    let mut value = root;
+    for segment in path {
+        let map = value.as_mapping()?;
+        value = map.get(YamlValue::String((*segment).to_string()))?;
+    }
+    Some(value)
+}
+
+fn optional_string(root: &YamlValue, path: &[&str]) -> Option<String> {
+    nested_value(root, path)
+        .and_then(YamlValue::as_str)
+        .map(str::to_string)
+}
+
+fn optional_bool(root: &YamlValue, path: &[&str]) -> Option<bool> {
+    nested_value(root, path).and_then(YamlValue::as_bool)
+}
+
+fn optional_u64(root: &YamlValue, path: &[&str]) -> Option<u64> {
+    nested_value(root, path).and_then(YamlValue::as_u64)
+}
+
+fn fallback_chains(value: Option<&YamlValue>) -> Vec<FallbackChain> {
+    let Some(YamlValue::Mapping(map)) = value else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(target, selectors)| {
+            let target = target.as_str()?.to_string();
+            Some(FallbackChain {
+                target,
+                selectors: string_list(Some(selectors)),
+            })
+        })
+        .collect()
+}
 
 fn nested_string_map(root: &YamlValue, path: &[&str]) -> BTreeMap<String, String> {
     let mut value = root;
@@ -287,32 +352,33 @@ fn ensure_mapping(value: &mut YamlValue) -> &mut Mapping {
     }
 }
 
-fn set_nested_string(root: &mut YamlValue, path: &[&str], value: &str) {
-    if path.is_empty() {
-        return;
-    }
-
-    let mut current = root;
-    for segment in &path[..path.len() - 1] {
-        let map = ensure_mapping(current);
-        let key = YamlValue::String((*segment).to_string());
-        current = map
-            .entry(key)
-            .or_insert_with(|| YamlValue::Mapping(Mapping::new()));
-    }
-
-    let map = ensure_mapping(current);
-    let key = YamlValue::String(path[path.len() - 1].to_string());
-    if value.trim().is_empty() {
+fn remove_nested_value(root: &mut YamlValue, path: &[&str]) -> bool {
+    let Some(map) = root.as_mapping_mut() else {
+        return false;
+    };
+    let key = YamlValue::String(path[0].to_string());
+    if path.len() == 1 {
         map.remove(&key);
-    } else {
-        map.insert(key, YamlValue::String(value.trim().to_string()));
+        return map.is_empty();
     }
+
+    let remove_child = map
+        .get_mut(&key)
+        .is_some_and(|child| remove_nested_value(child, &path[1..]));
+    if remove_child {
+        map.remove(&key);
+    }
+    map.is_empty()
 }
-fn set_nested_string_list(root: &mut YamlValue, path: &[&str], values: &[String]) {
+
+fn set_nested_value(root: &mut YamlValue, path: &[&str], value: Option<YamlValue>) {
     if path.is_empty() {
         return;
     }
+    let Some(value) = value else {
+        remove_nested_value(root, path);
+        return;
+    };
 
     let mut current = root;
     for segment in &path[..path.len() - 1] {
@@ -325,14 +391,61 @@ fn set_nested_string_list(root: &mut YamlValue, path: &[&str], values: &[String]
 
     let map = ensure_mapping(current);
     let key = YamlValue::String(path[path.len() - 1].to_string());
-    if values.is_empty() {
-        map.remove(&key);
+    map.insert(key, value);
+}
+
+fn set_nested_string(root: &mut YamlValue, path: &[&str], value: &str) {
+    let trimmed = value.trim();
+    set_nested_value(
+        root,
+        path,
+        (!trimmed.is_empty()).then(|| YamlValue::String(trimmed.to_string())),
+    );
+}
+
+fn set_nested_optional_string(root: &mut YamlValue, path: &[&str], value: Option<&str>) {
+    set_nested_value(
+        root,
+        path,
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| YamlValue::String(value.to_string())),
+    );
+}
+
+fn set_nested_optional_bool(root: &mut YamlValue, path: &[&str], value: Option<bool>) {
+    set_nested_value(root, path, value.map(YamlValue::Bool));
+}
+
+fn set_nested_optional_u64(root: &mut YamlValue, path: &[&str], value: Option<u64>) {
+    set_nested_value(
+        root,
+        path,
+        value.map(|value| YamlValue::Number(value.into())),
+    );
+}
+
+fn set_nested_fallback_chains(root: &mut YamlValue, path: &[&str], chains: &[FallbackChain]) {
+    let value = if chains.is_empty() {
+        None
     } else {
-        map.insert(
-            key,
-            YamlValue::Sequence(values.iter().cloned().map(YamlValue::String).collect()),
-        );
-    }
+        let mut map = Mapping::new();
+        for chain in chains {
+            map.insert(
+                YamlValue::String(chain.target.trim().to_string()),
+                YamlValue::Sequence(
+                    chain
+                        .selectors
+                        .iter()
+                        .map(|selector| YamlValue::String(selector.trim().to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        Some(YamlValue::Mapping(map))
+    };
+    set_nested_value(root, path, value);
 }
 
 fn model_from_parts(
@@ -342,6 +455,9 @@ fn model_from_parts(
     reasoning: bool,
     thinking: Vec<String>,
     input: Vec<String>,
+    context_window: Option<u64>,
+    max_tokens: Option<u64>,
+    cost: Option<ModelCost>,
 ) -> Option<ModelOption> {
     if provider.is_empty() || id.is_empty() {
         return None;
@@ -354,6 +470,9 @@ fn model_from_parts(
         reasoning,
         thinking,
         input,
+        context_window,
+        max_tokens,
+        cost,
     })
 }
 
@@ -413,8 +532,29 @@ fn parse_models_json(content: &str) -> Result<Vec<ModelOption>, String> {
                     .collect()
             })
             .unwrap_or_default();
+        let context_window = object.get("contextWindow").and_then(JsonValue::as_u64);
+        let max_tokens = object.get("maxTokens").and_then(JsonValue::as_u64);
+        let cost = object.get("cost").and_then(|value| {
+            let cost = value.as_object()?;
+            Some(ModelCost {
+                input: cost.get("input")?.as_f64()?,
+                output: cost.get("output")?.as_f64()?,
+                cache_read: cost.get("cacheRead")?.as_f64()?,
+                cache_write: cost.get("cacheWrite")?.as_f64()?,
+            })
+        });
 
-        if let Some(model) = model_from_parts(provider, id, name, reasoning, thinking, input) {
+        if let Some(model) = model_from_parts(
+            provider,
+            id,
+            name,
+            reasoning,
+            thinking,
+            input,
+            context_window,
+            max_tokens,
+            cost,
+        ) {
             result.push(model);
         }
     }
@@ -436,8 +576,63 @@ fn dedupe_models(models: Vec<ModelOption>) -> Vec<ModelOption> {
     unique
 }
 
-fn executable_candidates() -> Vec<PathBuf> {
+fn default_system_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(home) = home_dir() {
+        paths.push(home.join(".bun").join("bin"));
+        paths.push(home.join(".local").join("bin"));
+        paths.push(home.join(".cargo").join("bin"));
+        paths.push(home.join(".nvm").join("versions").join("node"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(PathBuf::from("/opt/homebrew/bin"));
+        paths.push(PathBuf::from("/opt/homebrew/sbin"));
+        paths.push(PathBuf::from("/usr/local/bin"));
+        paths.push(PathBuf::from("/usr/local/sbin"));
+    }
+    #[cfg(unix)]
+    {
+        paths.push(PathBuf::from("/usr/bin"));
+        paths.push(PathBuf::from("/bin"));
+        paths.push(PathBuf::from("/usr/sbin"));
+        paths.push(PathBuf::from("/sbin"));
+    }
+    paths
+}
+
+fn build_subprocess_path(custom_parent: Option<&Path>) -> std::ffi::OsString {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(parent) = custom_parent.filter(|p| !p.as_os_str().is_empty()) {
+        if seen.insert(parent.to_path_buf()) {
+            paths.push(parent.to_path_buf());
+        }
+    }
+
+    if let Some(existing) = env::var_os("PATH") {
+        for p in env::split_paths(&existing) {
+            if seen.insert(p.clone()) {
+                paths.push(p);
+            }
+        }
+    }
+
+    for p in default_system_paths() {
+        if seen.insert(p.clone()) {
+            paths.push(p);
+        }
+    }
+
+    env::join_paths(paths.into_iter()).unwrap_or_default()
+}
+
+fn executable_candidates(custom_path: Option<&str>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    if let Some(custom) = custom_path.map(str::trim).filter(|value| !value.is_empty()) {
+        candidates.push(PathBuf::from(custom));
+    }
     if let Some(path) = env::var_os("PATH") {
         candidates.extend(env::split_paths(&path).map(|directory| directory.join("omp")));
     }
@@ -449,132 +644,47 @@ fn executable_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-fn load_omp_models() -> Result<Vec<ModelOption>, String> {
-    let mut last_error = "找不到 omp 可执行文件".to_string();
-    for candidate in executable_candidates() {
-        let output = match Command::new(&candidate)
-            .args(["models", "--json"])
-            .env("NO_COLOR", "1")
-            .output()
-        {
+fn load_omp_models(custom_path: Option<&str>) -> Result<Vec<ModelOption>, String> {
+    let candidates = executable_candidates(custom_path);
+    let mut failure_reasons = Vec::new();
+    for candidate in &candidates {
+        let mut command = Command::new(candidate);
+        command.args(["models", "--json"]).env("NO_COLOR", "1");
+        let subprocess_path = build_subprocess_path(candidate.parent());
+        command.env("PATH", subprocess_path);
+        let output = match command.output() {
             Ok(output) => output,
             Err(error) => {
-                last_error = error.to_string();
+                failure_reasons.push(format!("{}: {error}", candidate.display()));
                 continue;
             }
         };
 
         if !output.status.success() {
-            last_error = "omp models --json 执行失败".to_string();
+            let status_code = output
+                .status
+                .code()
+                .map_or("terminated".to_string(), |code| code.to_string());
+            failure_reasons.push(format!("{}: 进程退出码 {status_code}", candidate.display()));
             continue;
         }
         return parse_models_json(&String::from_utf8_lossy(&output.stdout));
     }
-    Err(last_error)
+
+    if let Some(custom) = custom_path.map(str::trim).filter(|value| !value.is_empty()) {
+        Err(format!(
+            "无法通过指定的 omp 路径 “{custom}” 读取模型列表。请检查可执行文件路径与权限。\n尝试详情：\n{}",
+            failure_reasons.join("\n")
+        ))
+    } else {
+        Err(format!(
+            "未找到可用的 omp 可执行文件或无法通过 `omp models --json` 读取模型。\n请指定 omp 的完整路径。\n尝试详情：\n{}",
+            failure_reasons.join("\n")
+        ))
+    }
 }
 
-fn parse_custom_models(path: &Path) -> Vec<ModelOption> {
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(YamlValue::Mapping(root)) = serde_yaml::from_str::<YamlValue>(&content) else {
-        return Vec::new();
-    };
-    let providers_key = YamlValue::String("providers".to_string());
-    let Some(YamlValue::Mapping(providers)) = root.get(&providers_key) else {
-        return Vec::new();
-    };
-
-    let mut result = Vec::new();
-    for (provider_key, provider_value) in providers {
-        let YamlValue::String(provider) = provider_key else {
-            continue;
-        };
-        let YamlValue::Mapping(provider_map) = provider_value else {
-            continue;
-        };
-        let models_key = YamlValue::String("models".to_string());
-        let Some(YamlValue::Sequence(models)) = provider_map.get(&models_key) else {
-            continue;
-        };
-        for model_value in models {
-            let YamlValue::Mapping(model_map) = model_value else {
-                continue;
-            };
-            let id_key = YamlValue::String("id".to_string());
-            let Some(YamlValue::String(id)) = model_map.get(&id_key) else {
-                continue;
-            };
-            let name = match model_map.get(&YamlValue::String("name".to_string())) {
-                Some(YamlValue::String(name)) => name.clone(),
-                _ => id.clone(),
-            };
-            if let Some(model) = model_from_parts(
-                provider.clone(),
-                id.clone(),
-                name,
-                false,
-                Vec::new(),
-                vec!["text".to_string()],
-            ) {
-                result.push(model);
-            }
-        }
-    }
-    result
-}
-
-fn selector_base(value: &str) -> Option<(String, String)> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.starts_with('@') {
-        return None;
-    }
-    let (base, effort) = trimmed
-        .rsplit_once(':')
-        .filter(|(_, suffix)| THINKING_LEVELS.contains(suffix))
-        .map_or((trimmed, ""), |(base, suffix)| (base, suffix));
-    let (provider, id) = base.split_once('/')?;
-    if provider.is_empty() || id.is_empty() {
-        return None;
-    }
-    Some((format!("{provider}/{id}"), effort.to_string()))
-}
-
-fn add_selector_models(models: &mut Vec<ModelOption>, selectors: impl IntoIterator<Item = String>) {
-    let known = models
-        .iter()
-        .map(|model| model.selector.clone())
-        .collect::<HashSet<_>>();
-    let mut additions = Vec::new();
-    for selector in selectors {
-        let Some((base, _)) = selector_base(&selector) else {
-            continue;
-        };
-        if known.contains(&base)
-            || additions
-                .iter()
-                .any(|model: &ModelOption| model.selector == base)
-        {
-            continue;
-        }
-        let Some((provider, id)) = base.split_once('/') else {
-            continue;
-        };
-        if let Some(model) = model_from_parts(
-            provider.to_string(),
-            id.to_string(),
-            id.to_string(),
-            false,
-            Vec::new(),
-            vec!["text".to_string()],
-        ) {
-            additions.push(model);
-        }
-    }
-    models.extend(additions);
-}
-
-fn load_snapshot_from_disk() -> Result<ConfigSnapshot, String> {
+fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapshot, String> {
     let agent = agent_dir()?;
     let config = config_file(&agent);
     let (root, config_exists) = load_yaml(&config)?;
@@ -583,44 +693,31 @@ fn load_snapshot_from_disk() -> Result<ConfigSnapshot, String> {
         _ => None,
     });
     let agent_model_overrides = nested_string_map(&root, &["task", "agentModelOverrides"]);
-    let disabled_providers = string_list(match &root {
-        YamlValue::Mapping(map) => map.get(YamlValue::String("disabledProviders".to_string())),
-        _ => None,
-    });
+    let routing_settings = RoutingSettings {
+        default_thinking_level: optional_string(&root, &["defaultThinkingLevel"]),
+        auto_thinking_max_effort: optional_string(&root, &["providers", "autoThinkingMaxEffort"]),
+        advisor_enabled: optional_bool(&root, &["advisor", "enabled"]),
+        advisor_sync_backlog: optional_string(&root, &["advisor", "syncBacklog"]),
+        advisor_immune_turns: optional_u64(&root, &["advisor", "immuneTurns"]),
+        prewalk_enabled: optional_bool(&root, &["prewalk", "enabled"]),
+        retry_model_fallback: optional_bool(&root, &["retry", "modelFallback"]),
+        retry_fallback_chains: fallback_chains(nested_value(&root, &["retry", "fallbackChains"])),
+        retry_fallback_revert_policy: optional_string(&root, &["retry", "fallbackRevertPolicy"]),
+    };
 
     let mut warnings = Vec::new();
     let agent_files = load_agent_files(&agent, &mut warnings);
-    let (mut models, model_source) = match load_omp_models() {
-        Ok(models) => (models, "omp models --json".to_string()),
-        Err(error) => {
-            warnings.push(format!(
-                "无法读取 OMP 实时模型列表，已使用配置中的模型: {error}"
-            ));
-            let custom = ["models.yml", "models.yaml"]
-                .iter()
-                .map(|name| parse_custom_models(&agent.join(name)))
-                .flatten()
-                .collect::<Vec<_>>();
-            (dedupe_models(custom), "config fallback".to_string())
-        }
-    };
-    let selectors = model_roles
-        .values()
-        .chain(agent_model_overrides.values())
-        .cloned()
-        .collect::<Vec<_>>();
-    add_selector_models(&mut models, selectors);
-    models = dedupe_models(models);
+    let models = load_omp_models(custom_omp_path)?;
 
     Ok(ConfigSnapshot {
         config_path: display_path(&config),
         config_exists,
         model_roles,
         agent_model_overrides,
-        disabled_providers,
         models,
-        model_source,
+        model_source: "omp models --json".to_string(),
         agent_files,
+        routing_settings,
         warnings,
     })
 }
@@ -663,35 +760,132 @@ fn write_text_atomically(path: &Path, content: &str) -> Result<(), String> {
     let temporary = path.with_file_name(format!(".{file_name}.omp-model-studio.tmp"));
     fs::write(&temporary, content)
         .map_err(|error| format!("写入 Agent Markdown 临时文件失败: {error}"))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("替换 Agent Markdown 失败: {error}"))?;
+    fs::rename(&temporary, path).map_err(|error| format!("替换 Agent Markdown 失败: {error}"))?;
+    Ok(())
+}
+
+fn selector_provider(selector: &str) -> Option<&str> {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() || trimmed.starts_with('@') {
+        return None;
+    }
+    let base = trimmed
+        .rsplit_once(':')
+        .filter(|(_, suffix)| THINKING_LEVELS.contains(suffix))
+        .map_or(trimmed, |(base, _)| base);
+    base.split_once('/').map(|(provider, _)| provider)
+}
+
+fn validate_routing_settings(settings: &RoutingSettings) -> Result<(), String> {
+    if let Some(level) = settings.default_thinking_level.as_deref() {
+        if !CONFIGURED_THINKING_LEVELS.contains(&level) {
+            return Err(format!("defaultThinkingLevel “{level}”无效"));
+        }
+    }
+    if let Some(level) = settings.auto_thinking_max_effort.as_deref() {
+        if !AUTO_THINKING_MAX_EFFORTS.contains(&level) {
+            return Err(format!("providers.autoThinkingMaxEffort “{level}”无效"));
+        }
+    }
+    if let Some(backlog) = settings.advisor_sync_backlog.as_deref() {
+        if !ADVISOR_SYNC_BACKLOGS.contains(&backlog) {
+            return Err(format!("advisor.syncBacklog “{backlog}”无效"));
+        }
+    }
+    if let Some(policy) = settings.retry_fallback_revert_policy.as_deref() {
+        if !FALLBACK_REVERT_POLICIES.contains(&policy) {
+            return Err(format!("retry.fallbackRevertPolicy “{policy}”无效"));
+        }
+    }
+
+    let mut targets = HashSet::new();
+    for chain in &settings.retry_fallback_chains {
+        let target = chain.target.trim();
+        if target.is_empty() {
+            return Err("Fallback chain 缺少 target".to_string());
+        }
+        if !targets.insert(target) {
+            return Err(format!("Fallback target “{target}”重复"));
+        }
+        if chain.selectors.is_empty() {
+            return Err(format!("Fallback target “{target}”至少需要一个候选模型"));
+        }
+        let mut selectors = HashSet::new();
+        for selector in &chain.selectors {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                return Err(format!("Fallback target “{target}”包含空模型"));
+            }
+            if selector == target {
+                return Err(format!("Fallback target “{target}”不能回退到自身"));
+            }
+            if !selectors.insert(selector) {
+                return Err(format!("Fallback target “{target}”重复使用 “{selector}”"));
+            }
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn load_snapshot() -> Result<ConfigSnapshot, String> {
-    load_snapshot_from_disk()
+fn load_snapshot(omp_path: Option<String>) -> Result<ConfigSnapshot, String> {
+    load_snapshot_from_disk(omp_path.as_deref())
 }
-
 #[tauri::command]
 fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
     let agent = agent_dir()?;
     let config = config_file(&agent);
     let (mut root, _) = load_yaml(&config)?;
 
-    let mut seen_roles = HashSet::new();
-    for custom in &request.custom_roles {
-        let role = custom.role.trim();
-        if !valid_custom_role(role) {
+    for (role, selector) in &request.model_roles {
+        let role = role.trim();
+        if !SYSTEM_MODEL_ROLES.contains(&role) && !valid_custom_role(role) {
             return Err(format!(
                 "自定义 Role “{role}”无效：仅允许小写字母开头及小写字母、数字、-、_，且不能覆盖 OMP 系统 Role"
             ));
         }
-        if custom.selector.trim().is_empty() {
+        if !SYSTEM_MODEL_ROLES.contains(&role) && selector.trim().is_empty() {
             return Err(format!("自定义 Role “{role}”尚未选择模型"));
         }
-        if !seen_roles.insert(role.to_string()) {
-            return Err(format!("自定义 Role “{role}”重复"));
+    }
+    let mut removed_roles = HashSet::new();
+    for role in &request.removed_model_roles {
+        let role = role.trim();
+        if !valid_custom_role(role) {
+            return Err(format!("只能删除有效的自定义 Role，收到 “{role}”"));
+        }
+        if request.model_roles.contains_key(role) {
+            return Err(format!("自定义 Role “{role}”不能同时保存和删除"));
+        }
+        if !removed_roles.insert(role) {
+            return Err(format!("待删除的自定义 Role “{role}”重复"));
+        }
+    }
+
+    validate_routing_settings(&request.routing_settings)?;
+
+    let shadowed = request
+        .shadowed_providers
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    for (label, selector) in request
+        .model_roles
+        .iter()
+        .chain(request.agent_model_overrides.iter())
+    {
+        if selector_provider(selector).is_some_and(|provider| shadowed.contains(provider)) {
+            return Err(format!("“{label}”仍使用 shadowed provider"));
+        }
+    }
+    for chain in &request.routing_settings.retry_fallback_chains {
+        for selector in &chain.selectors {
+            if selector_provider(selector).is_some_and(|provider| shadowed.contains(provider)) {
+                return Err(format!(
+                    "Fallback target “{}”仍使用 shadowed provider",
+                    chain.target.trim()
+                ));
+            }
         }
     }
 
@@ -738,40 +932,59 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
         write_text_atomically(&path, content)?;
     }
 
-    let roles = [
-        ("smol", request.smol.as_str()),
-        ("default", request.default.as_str()),
-        ("slow", request.slow.as_str()),
-        ("advisor", request.advisor.as_str()),
-        ("vision", request.vision.as_str()),
-    ];
-    for (role, selector) in roles {
-        set_nested_string(&mut root, &["modelRoles", role], selector);
+    for role in &request.removed_model_roles {
+        set_nested_value(&mut root, &["modelRoles", role.trim()], None);
     }
-    for custom in &request.custom_roles {
+    for (role, selector) in &request.model_roles {
+        set_nested_string(&mut root, &["modelRoles", role.trim()], selector);
+    }
+    for (agent_name, selector) in &request.agent_model_overrides {
         set_nested_string(
             &mut root,
-            &["modelRoles", custom.role.trim()],
-            &custom.selector,
+            &["task", "agentModelOverrides", agent_name.trim()],
+            selector,
         );
     }
-    set_nested_string(
+    let routing = &request.routing_settings;
+    set_nested_optional_string(
         &mut root,
-        &["task", "agentModelOverrides", "reviewer"],
-        &request.reviewer,
+        &["defaultThinkingLevel"],
+        routing.default_thinking_level.as_deref(),
     );
-    set_nested_string(
+    set_nested_optional_string(
         &mut root,
-        &["task", "agentModelOverrides", "security-reviewer"],
-        &request.security_reviewer,
+        &["providers", "autoThinkingMaxEffort"],
+        routing.auto_thinking_max_effort.as_deref(),
     );
-    set_nested_string_list(
+    set_nested_optional_bool(&mut root, &["advisor", "enabled"], routing.advisor_enabled);
+    set_nested_optional_string(
         &mut root,
-        &["disabledProviders"],
-        &request.disabled_providers,
+        &["advisor", "syncBacklog"],
+        routing.advisor_sync_backlog.as_deref(),
+    );
+    set_nested_optional_u64(
+        &mut root,
+        &["advisor", "immuneTurns"],
+        routing.advisor_immune_turns,
+    );
+    set_nested_optional_bool(&mut root, &["prewalk", "enabled"], routing.prewalk_enabled);
+    set_nested_optional_bool(
+        &mut root,
+        &["retry", "modelFallback"],
+        routing.retry_model_fallback,
+    );
+    set_nested_fallback_chains(
+        &mut root,
+        &["retry", "fallbackChains"],
+        &routing.retry_fallback_chains,
+    );
+    set_nested_optional_string(
+        &mut root,
+        &["retry", "fallbackRevertPolicy"],
+        routing.retry_fallback_revert_policy.as_deref(),
     );
     write_yaml_atomically(&config, &root)?;
-    load_snapshot_from_disk()
+    load_snapshot_from_disk(request.omp_path.as_deref())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -812,35 +1025,77 @@ mod tests {
         fs::create_dir_all(&agent).expect("test config directory should be created");
         fs::write(
             agent.join("config.yml"),
-            "modelRoles:\n  default: old/default\n  keep: keep/model\ntask:\n  agentModelOverrides:\n    keep-agent: keep/agent\notherSetting: preserved\n",
+            "modelRoles:\n  default: old/default\n  keep: keep/model\n  remove-me: old/remove\ndisabledProviders:\n  - ollama\ntask:\n  agentModelOverrides:\n    keep-agent: keep/agent\notherSetting: preserved\n",
         )
         .expect("test config should be written");
+
+        let bin_dir = home.join(".bun").join("bin");
+        fs::create_dir_all(&bin_dir).expect("mock bin directory should be created");
+        let mock_omp = bin_dir.join("omp");
+        fs::write(
+            &mock_omp,
+            "#!/bin/sh\necho '{\"models\":[{\"provider\":\"openai\",\"id\":\"default\",\"name\":\"Default\"},{\"provider\":\"openai\",\"id\":\"vision\",\"name\":\"Vision\"},{\"provider\":\"google\",\"id\":\"tester\",\"name\":\"Tester\"},{\"provider\":\"openai\",\"id\":\"release\",\"name\":\"Release\"}]}'\n",
+        )
+        .expect("mock omp script should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&mock_omp).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&mock_omp, permissions).expect("chmod");
+        }
 
         let previous_home = env::var_os("HOME");
         env::set_var("HOME", &home);
         let result = save_snapshot(SaveRequest {
-            smol: "google/smol:low".to_string(),
-            default: "openai/default:max".to_string(),
-            slow: "anthropic/slow:xhigh".to_string(),
-            vision: "openai/vision:xhigh".to_string(),
-            advisor: "openai/advisor:high".to_string(),
-            custom_roles: vec![
-                CustomRoleSave {
-                    role: "tester".to_string(),
-                    selector: "google/tester:medium".to_string(),
-                },
-                CustomRoleSave {
-                    role: "release-budget".to_string(),
-                    selector: "openai/release:high".to_string(),
-                },
-            ],
+            model_roles: BTreeMap::from([
+                ("smol".to_string(), "google/smol:low".to_string()),
+                ("default".to_string(), "openai/default:max".to_string()),
+                ("slow".to_string(), "anthropic/slow:xhigh".to_string()),
+                ("plan".to_string(), "openai/plan:max".to_string()),
+                ("task".to_string(), "openai/task:xhigh".to_string()),
+                ("vision".to_string(), "openai/vision:xhigh".to_string()),
+                ("designer".to_string(), "openai/designer:high".to_string()),
+                ("commit".to_string(), "google/commit:low".to_string()),
+                ("tiny".to_string(), "google/tiny:low".to_string()),
+                ("advisor".to_string(), "openai/advisor:high".to_string()),
+                ("tester".to_string(), "google/tester:medium".to_string()),
+                (
+                    "release-budget".to_string(),
+                    "openai/release:high".to_string(),
+                ),
+            ]),
+            removed_model_roles: vec!["remove-me".to_string()],
+            agent_model_overrides: BTreeMap::from([
+                (
+                    "reviewer".to_string(),
+                    "anthropic/reviewer:xhigh".to_string(),
+                ),
+                (
+                    "security-reviewer".to_string(),
+                    "anthropic/security:xhigh".to_string(),
+                ),
+            ]),
             agent_files: vec![AgentFileSave {
                 file_name: "release-coordinator.md".to_string(),
                 agent_markdown: "---\nname: release-coordinator\ndescription: Release verification agent.\nmodel: \"@slow\"\n---\n\nRun the release verification workflow.\n".to_string(),
             }],
-            reviewer: "anthropic/reviewer:xhigh".to_string(),
-            security_reviewer: "anthropic/security:xhigh".to_string(),
-            disabled_providers: vec!["ollama".to_string()],
+            shadowed_providers: vec!["ollama".to_string()],
+            routing_settings: RoutingSettings {
+                default_thinking_level: Some("auto".to_string()),
+                auto_thinking_max_effort: Some("xhigh".to_string()),
+                advisor_enabled: Some(true),
+                advisor_sync_backlog: Some("1".to_string()),
+                advisor_immune_turns: Some(2),
+                prewalk_enabled: Some(true),
+                retry_model_fallback: Some(true),
+                retry_fallback_chains: vec![FallbackChain {
+                    target: "default".to_string(),
+                    selectors: vec!["openai/fallback:xhigh".to_string()],
+                }],
+                retry_fallback_revert_policy: Some("cooldown-expiry".to_string()),
+            },
+            omp_path: None,
         });
         if let Some(previous_home) = previous_home {
             env::set_var("HOME", previous_home);
@@ -865,6 +1120,7 @@ mod tests {
             snapshot.model_roles.get("release-budget"),
             Some(&"openai/release:high".to_string())
         );
+        assert!(!snapshot.model_roles.contains_key("remove-me"));
         assert_eq!(
             snapshot
                 .agent_files
@@ -881,7 +1137,15 @@ mod tests {
             snapshot.agent_model_overrides.get("security-reviewer"),
             Some(&"anthropic/security:xhigh".to_string())
         );
-        assert_eq!(snapshot.disabled_providers, vec!["ollama".to_string()]);
+        assert_eq!(
+            snapshot.routing_settings.default_thinking_level.as_deref(),
+            Some("auto")
+        );
+        assert_eq!(snapshot.routing_settings.advisor_enabled, Some(true));
+        assert_eq!(
+            snapshot.routing_settings.retry_fallback_chains[0].selectors,
+            vec!["openai/fallback:xhigh".to_string()]
+        );
         let agent_markdown = fs::read_to_string(agent.join("agents/release-coordinator.md"))
             .expect("independent agent markdown should be written");
         assert!(agent_markdown.contains("model: \"@slow\""));
@@ -906,6 +1170,106 @@ mod tests {
                 .map(String::as_str),
             Some("openai/release:high")
         );
+        assert_eq!(
+            string_list(parsed.get("disabledProviders")),
+            vec!["ollama".to_string()],
+            "OMP disabledProviders must remain untouched by Model Studio"
+        );
+        assert!(
+            !nested_string_map(&parsed, &["modelRoles"]).contains_key("remove-me"),
+            "explicitly removed custom roles must be deleted from config.yml"
+        );
+        assert_eq!(
+            optional_string(&parsed, &["defaultThinkingLevel"]).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(optional_bool(&parsed, &["prewalk", "enabled"]), Some(true));
+        assert_eq!(
+            fallback_chains(nested_value(&parsed, &["retry", "fallbackChains"]))[0].selectors,
+            vec!["openai/fallback:xhigh".to_string()]
+        );
         fs::remove_dir_all(home).expect("isolated test home should be removed");
+    }
+
+    #[test]
+    fn clearing_nested_values_does_not_leave_empty_parent_mappings() {
+        let mut root: YamlValue =
+            serde_yaml::from_str("otherSetting: preserved\nadvisor:\n  enabled: true\n")
+                .expect("fixture should be valid YAML");
+
+        set_nested_optional_bool(&mut root, &["advisor", "enabled"], None);
+        set_nested_optional_bool(&mut root, &["prewalk", "enabled"], None);
+
+        assert!(nested_value(&root, &["advisor"]).is_none());
+        assert!(nested_value(&root, &["prewalk"]).is_none());
+        assert_eq!(
+            root.get("otherSetting").and_then(YamlValue::as_str),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn model_catalog_parser_keeps_limits_and_pricing() {
+        let models = parse_models_json(
+            r#"{"models":[{"provider":"openai-codex","id":"gpt-5.6-terra","name":"GPT-5.6-Terra","reasoning":true,"thinking":["low","high","xhigh"],"input":["text","image"],"contextWindow":372000,"maxTokens":128000,"cost":{"input":2,"output":12,"cacheRead":0.2,"cacheWrite":2.5}}]}"#,
+        )
+        .expect("model catalog should parse");
+
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.context_window, Some(372_000));
+        assert_eq!(model.max_tokens, Some(128_000));
+        let cost = model.cost.as_ref().expect("pricing should be retained");
+        assert_eq!(cost.input, 2.0);
+        assert_eq!(cost.output, 12.0);
+        assert_eq!(cost.cache_read, 0.2);
+        assert_eq!(cost.cache_write, 2.5);
+    }
+
+    #[test]
+    fn yaml_round_trip_preserves_omp_string_enums() {
+        // OMP parses config with Bun's YAML: bare on/off are strings, but bare
+        // digits are numbers, so digit-like enum values must stay quoted on write.
+        let mut root = YamlValue::Mapping(Mapping::new());
+        set_nested_optional_string(&mut root, &["advisor", "syncBacklog"], Some("1"));
+        set_nested_string(&mut root, &["completion", "notify"], "on");
+
+        let written = serde_yaml::to_string(&root).expect("config should serialize");
+        let digit_line = written
+            .lines()
+            .find(|line| line.contains("syncBacklog"))
+            .expect("syncBacklog should be written");
+        assert!(
+            digit_line.contains("'1'") || digit_line.contains("\"1\""),
+            "digit enum strings must stay quoted: {written}"
+        );
+
+        let reparsed: YamlValue =
+            serde_yaml::from_str(&written).expect("written config should reparse");
+        assert_eq!(
+            optional_string(&reparsed, &["advisor", "syncBacklog"]).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            optional_string(&reparsed, &["completion", "notify"]).as_deref(),
+            Some("on"),
+            "bare on must survive serde_yaml parse as a string for Bun/OMP"
+        );
+    }
+
+    #[test]
+    fn build_subprocess_path_puts_custom_parent_first_and_includes_system_paths() {
+        let custom = Path::new("/custom/bin");
+        let result = build_subprocess_path(Some(custom));
+        let result_str = result.to_string_lossy();
+        assert!(result_str.starts_with("/custom/bin:"));
+        #[cfg(target_os = "macos")]
+        assert!(result_str.contains("/opt/homebrew/bin"));
+    }
+
+    #[test]
+    fn custom_omp_path_takes_precedence_in_candidates() {
+        let candidates = executable_candidates(Some("/opt/custom/omp"));
+        assert_eq!(candidates.first(), Some(&PathBuf::from("/opt/custom/omp")));
     }
 }

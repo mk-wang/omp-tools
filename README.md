@@ -6,13 +6,15 @@ OMP Model Studio 是一个基于 Tauri 2、React 19 和 Rust 的桌面控制面�
 
 ## 功能
 
-- **模型 Role**：配置 `default`、`smol`、`slow`、`vision` 和 `advisor`。
+- **全部内建模型 Role**：配置 `default`、`smol`、`slow`、`plan`、`task`、`vision`、`designer`、`commit`、`tiny` 和 `advisor`。
 - **内建 Agent 模型覆盖**：分别配置 `reviewer` 与 `security-reviewer` 使用的模型；两者不是模型 Role。
-- **自定义模型 Role**：为独立的模型、成本或延迟边界增加自定义 Role。
+- **自定义模型 Role**：为独立的模型、成本或延迟边界增加自定义 Role；移除采用两步确认，并阻止删除仍被引用的 Role。
 - **自定义 Agent**：创建和编辑 `~/.omp/agent/agents/*.md`，使用 YAML frontmatter 描述名称、用途和模型 Role。
-- **模型目录**：优先调用本机 `omp models --json`，失败时回退到 OMP agent 目录中的 `models.yml` / `models.yaml`。
-- **Provider 管理**：禁用 provider 后，该 provider 的模型不会出现在新的选择列表中；已选模型会在 Apply 前被校验。
-- **本地预设与主题**：在 WebView `localStorage` 中保存模型组合和主题偏好。预设不包含 Agent Markdown。
+- **模型能力与价格**：从 `omp models --json` 展示输入能力、thinking、上下文、输出上限及 input/output/cache 价格。
+- **路由策略**：配置全局 thinking、auto thinking 上限、Advisor runtime、Prewalk 和 retry model fallback。
+- **Fallback chain**：按 Role、具体模型或 provider wildcard 维护有序候选，并校验空值、重复、自循环和 shadowed provider。
+- **Provider 管理**：Provider 列表始终来自 `omp models --json` 的当前可用结果；本工具的 shadow 设置只过滤模型选择，并在 Apply 前校验已有路由。
+- **完整路由预设与主题**：在 WebView `localStorage` 中保存模型、路由策略和 provider 状态；Agent Markdown 保持独立。
 - **安全写入**：配置文件和 Agent Markdown 使用同目录临时文件写入后原子替换。
 
 ## Role 与 Agent 的边界
@@ -37,6 +39,9 @@ provider/model-id[:effort]
 openai-codex/gpt-5.6-terra:max
 google-antigravity/gemini-3.7-flash:high
 ```
+
+
+完整的 Role、Agent、Advisor 和控制面语义见 [`ROLE-GUIDE.md`](ROLE-GUIDE.md)。该指南不复制个人配置快照；实际值始终以当前 OMP 配置和安装版本为准。
 
 ## 环境要求
 
@@ -76,17 +81,19 @@ omp models --json
 
 1. 安装 OMP，并确认 `omp models --json` 可以执行。
 2. 启动 `bun run tauri dev`。
-3. 在模型 Role 卡片中选择模型和 thinking effort。
-4. 按需新增自定义 Role 或自定义 Agent。
-5. 在 Provider 列表中启用或禁用 provider。
-6. 确认没有非法选择后点击 **Apply**，将草稿写入本机 OMP 配置。
+3. 在全部内建模型 Role 卡片中选择模型和 thinking effort。
+4. 配置全局 thinking、Advisor、Prewalk 与 fallback chain。
+5. 按需新增自定义 Role 或自定义 Agent，并调整 provider 状态。
+6. 确认没有非法选择后点击 **Apply**，将完整路由草稿写入本机 OMP 配置。
 
 所有模型和 Agent 编辑都先保存在应用草稿中，不会在点击 **Apply** 前写入磁盘。应用写入配置前会校验：
 
 - 自定义 Role 名称不能覆盖 OMP 系统 Role，且必须以小写字母开头，只能包含小写字母、数字、`-`、`_`。
 - 自定义 Role 必须选择模型。
 - Agent Markdown 必须包含 `name`、`description`、`model` 三个 frontmatter 字段，并包含非空正文。
-- 已禁用 provider 不能继续被模型 Role 使用。
+- shadowed provider 不能继续被模型 Role 使用。
+- Fallback target 必须唯一且至少有一个候选；候选不能留空、重复、回退到自身或继续使用 shadowed provider。
+- 空白的全局策略控件表示继承 OMP 默认，不会强行写入一个覆盖值。
 
 ### Agent Markdown 示例
 
@@ -102,11 +109,12 @@ Run the release verification workflow and report concrete findings.
 
 ## 配置写入与数据边界
 
-- 后端只更新受管理的 YAML 映射：`modelRoles`、`task.agentModelOverrides` 和 `disabledProviders`；未识别的配置键会保留。
+- 后端只更新受管理的 YAML 映射：`modelRoles`、`task.agentModelOverrides`、thinking/Advisor/Prewalk 设置和 `retry.fallbackChains`；未识别的配置键（包括 OMP 自己管理的 `disabledProviders`）会保留。
+- Provider shadow 状态只保存在本工具的 WebView `localStorage` / 预设中，不会写入 OMP 的 `disabledProviders`；OMP 登录状态变化由下一次 `omp models --json` 读取决定。
 - YAML 会经过 `serde_yaml` 重新序列化，因此格式和注释可能被重写；如需保留原始格式，请在 Apply 前备份配置文件。
 - 配置和 Agent 文件先写入同目录隐藏临时文件，再通过 rename 原子替换，避免留下半写入文件。
 - 应用界面显示路径时会将用户主目录压缩为 `~/`。
-- 本工具的范围不包括 Skill、provider 凭据、OMP 运行权限或其他未列出的配置。
+- 本工具的范围不包括 Skill、provider 凭据、OMP 运行权限或其他非模型路由配置。
 
 ## 开发命令
 
@@ -128,6 +136,8 @@ bun run tauri build
 ## 项目结构
 
 ```text
+ROLE-GUIDE.md  # Role、Agent、Advisor 与运行时控制语义
+
 src/
 ├── App.tsx       # 主界面、草稿状态、验证、预设和主题
 ├── api.ts        # Tauri IPC 调用
@@ -135,7 +145,7 @@ src/
 └── styles.css    # 单一 vanilla CSS 设计系统
 
 src-tauri/
-├── src/lib.rs    # 配置发现、模型目录、YAML 与 Agent 持久化
+├── src/lib.rs    # 配置发现、模型元数据、路由策略、YAML 与 Agent 持久化
 ├── src/main.rs   # Tauri 二进制入口
 ├── capabilities/ # Tauri 权限配置
 └── tauri.conf.json
