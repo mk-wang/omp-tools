@@ -264,6 +264,34 @@ function providerForSelector(value: string): string {
   return base.includes("/") ? base.split("/")[0] : "";
 }
 
+function isUnavailableModelSelector(value: string, models: ModelOption[]): boolean {
+  const parsed = splitSelector(value);
+  if (!parsed.base || parsed.alias || !parsed.base.includes("/") || parsed.base.endsWith("/*")) return false;
+  return !models.some(model => model.selector === parsed.base);
+}
+
+function modelSelectorError(value: string, models: ModelOption[], allowProviderWildcard = false): string {
+  const parsed = splitSelector(value);
+  if (!parsed.base || parsed.alias) return "";
+  if (parsed.base.endsWith("/*")) {
+    return allowProviderWildcard && /^[^/]+\/\*$/.test(parsed.base)
+      ? ""
+      : "模型 selector 格式无效，请使用 provider/model 或 @role。";
+  }
+  if (!parsed.base.includes("/")) {
+    return allowProviderWildcard
+      ? "模型 selector 格式无效，请使用 provider/model、provider/* 或 @role。"
+      : "模型 selector 格式无效，请使用 provider/model 或 @role。";
+  }
+  return isUnavailableModelSelector(value, models)
+    ? "当前配置模型不在 OMP 当前可用模型列表中。"
+    : "";
+}
+
+function firstModelSelector(value: string): string {
+  return value.split(",").map(item => item.trim()).find(Boolean) ?? "";
+}
+
 function createPresetId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
   return `preset-${Date.now()}`;
@@ -507,6 +535,7 @@ function ModelPicker({
   const availableModels = filteredModels.length > 0 ? filteredModels : providerModels;
   const selectedModel = currentModel ?? availableModels[0];
   const selectedBase = parsed.base || selectedModel?.selector || "";
+  const currentModelError = modelSelectorError(value, models);
   const providerHasModels = (provider: string) => models.some(model => model.provider === provider);
   const effortOptions = useMemo(() => thinkingOptionsForModel(selectedModel), [selectedModel]);
 
@@ -594,6 +623,7 @@ function ModelPicker({
       {(parsed.base ? currentModel : selectedModel) && (
         <ModelMetadata model={(parsed.base ? currentModel : selectedModel)!} />
       )}
+      {currentModelError && <p className="model-picker-warning">{currentModelError}</p>}
     </div>
   );
 }
@@ -961,7 +991,9 @@ function SlotCard({
   const followsSlow = isReviewer ? reviewerFollowsSlow : isSecurityReviewer ? securityReviewerFollowsSlow : false;
   const effectiveValue = followsSlow ? slowValue : value;
   const effectiveProvider = providerForSelector(effectiveValue);
-  const isInvalid = Boolean(effectiveProvider && shadowedProviders.includes(effectiveProvider));
+  const isShadowed = Boolean(effectiveProvider && shadowedProviders.includes(effectiveProvider));
+  const modelError = modelSelectorError(effectiveValue, models);
+  const isInvalid = isShadowed || Boolean(modelError);
   const followKey = isSecurityReviewer ? "securityReviewer" : "reviewer";
   const isFollowable = isReviewer || isSecurityReviewer;
 
@@ -982,7 +1014,14 @@ function SlotCard({
           </div>
         </div>
         <div className="slot-header-meta">
-          {isInvalid && <span className="invalid-badge">非法</span>}
+          {isInvalid && (
+            <span
+              className="invalid-badge"
+              title={modelError || "配置使用了 shadowed provider"}
+            >
+              非法
+            </span>
+          )}
         </div>
       </div>
 
@@ -1035,7 +1074,9 @@ function CustomRoleCard({
   onDelete: () => void;
 }) {
   const provider = providerForSelector(customRole.value);
-  const isInvalid = Boolean(provider && shadowedProviders.includes(provider));
+  const isShadowed = Boolean(provider && shadowedProviders.includes(provider));
+  const modelError = modelSelectorError(customRole.value, models);
+  const isInvalid = isShadowed || Boolean(modelError);
   return (
     <article className={`slot-card cyan custom-role-card${isInvalid ? " invalid" : ""}`}>
       <div className="slot-header">
@@ -1051,7 +1092,14 @@ function CustomRoleCard({
           </div>
         </div>
         <div className="custom-role-actions">
-          {isInvalid && <span className="invalid-badge">非法</span>}
+          {isInvalid && (
+            <span
+              className="invalid-badge"
+              title={modelError || "配置使用了 shadowed provider"}
+            >
+              非法
+            </span>
+          )}
           <button className="button quiet compact danger" onClick={onDelete}>
             {deletePending ? "确认移除" : "移除"}
           </button>
@@ -1070,14 +1118,22 @@ function CustomRoleCard({
 
 function CustomAgentCard({
   agent,
+  models,
+  shadowedProviders,
   onEdit
 }: {
   agent: CustomAgent;
+  models: ModelOption[];
+  shadowedProviders: string[];
   onEdit: () => void;
 }) {
   const validationError = validateAgentMarkdown(agent.agentMarkdown);
+  const agentProvider = providerForSelector(agent.model);
+  const isShadowed = Boolean(agentProvider && shadowedProviders.includes(agentProvider));
+  const modelError = modelSelectorError(agent.model, models);
+  const isInvalid = Boolean(validationError || isShadowed || modelError);
   return (
-    <article className={`agent-card${validationError ? " invalid" : ""}`}>
+    <article className={`agent-card${isInvalid ? " invalid" : ""}`}>
       <div className="agent-card-main">
         <div className="slot-title-line">
           <h2>{agent.name}</h2>
@@ -1090,7 +1146,14 @@ function CustomAgentCard({
       <div className="agent-card-actions">
         <span>MODEL / ROLE</span>
         <code>{agent.model}</code>
-        {validationError && <span className="invalid-badge">非法</span>}
+        {isInvalid && (
+          <span
+            className="invalid-badge"
+            title={validationError || modelError || "配置使用了 shadowed provider"}
+          >
+            非法
+          </span>
+        )}
         <button className="button compact" onClick={onEdit}>编辑 Markdown</button>
       </div>
     </article>
@@ -1287,7 +1350,7 @@ function AgentModal({
                 ...editor,
                 agentMarkdown,
                 description: frontmatterField(agentMarkdown, "description") || editor.description,
-                model: frontmatterField(agentMarkdown, "model") || editor.model
+                model: firstModelSelector(frontmatterField(agentMarkdown, "model")) || editor.model
               });
             }}
             placeholder="输入包含 name、description、model frontmatter 与正文的 Agent Markdown"
@@ -1437,33 +1500,47 @@ export default function App() {
   const selectedModelSlots = useMemo(() => {
     const fixedAssignments = SLOT_DEFINITIONS.map(definition => {
       if (definition.key === "reviewer" && reviewerFollowsSlow) {
-        return { label: definition.title, value: values.slow, base: splitSelector(values.slow).base };
+        return { label: definition.title, value: values.slow, base: splitSelector(values.slow).base, allowProviderWildcard: false };
       }
       if (definition.key === "securityReviewer" && securityReviewerFollowsSlow) {
-        return { label: definition.title, value: values.slow, base: splitSelector(values.slow).base };
+        return { label: definition.title, value: values.slow, base: splitSelector(values.slow).base, allowProviderWildcard: false };
       }
       const value = values[definition.key];
-      return { label: definition.title, value, base: splitSelector(value).base };
+      return { label: definition.title, value, base: splitSelector(value).base, allowProviderWildcard: false };
     });
     const customAssignments = customRoles.map(customRole => ({
       label: customRole.role,
       value: customRole.value,
-      base: splitSelector(customRole.value).base
+      base: splitSelector(customRole.value).base,
+      allowProviderWildcard: false
     }));
     const fallbackAssignments = routingSettings.retryFallbackChains.flatMap(chain =>
       chain.selectors.map((selector, index) => ({
         label: `Fallback ${chain.target || "new"} ${index + 1}`,
         value: selector,
-        base: splitSelector(selector).base
+        base: splitSelector(selector).base,
+        allowProviderWildcard: true
       }))
     );
     return [...fixedAssignments, ...customAssignments, ...fallbackAssignments]
       .filter(item => item.base && !item.base.startsWith("@"));
   }, [customRoles, reviewerFollowsSlow, routingSettings.retryFallbackChains, securityReviewerFollowsSlow, values]);
-  const invalidSelections = selectedModelSlots.filter(item => shadowedProviders.includes(providerForSelector(item.value)));
+  const availableModels = snapshot?.models ?? [];
+  const invalidSelections = selectedModelSlots.filter(item => {
+    const provider = providerForSelector(item.value);
+    return shadowedProviders.includes(provider)
+      || Boolean(modelSelectorError(item.value, availableModels, item.allowProviderWildcard));
+  });
   const hasInvalidSelections = invalidSelections.length > 0;
+  const hasUnavailableSelections = invalidSelections.some(item => isUnavailableModelSelector(item.value, availableModels));
   const invalidCustomRoles = customRoles.filter(customRole => !customRole.value.trim());
-  const invalidAgents = customAgents.filter(agent => Boolean(validateAgentMarkdown(agent.agentMarkdown)));
+  const invalidAgentModels = customAgents.filter(agent => {
+    const provider = providerForSelector(agent.model);
+    return shadowedProviders.includes(provider) || Boolean(modelSelectorError(agent.model, availableModels));
+  });
+  const hasUnavailableAgents = invalidAgentModels.some(agent => isUnavailableModelSelector(agent.model, availableModels));
+  const invalidAgentMarkdown = customAgents.filter(agent => Boolean(validateAgentMarkdown(agent.agentMarkdown)));
+  const invalidAgents = [...new Set([...invalidAgentMarkdown, ...invalidAgentModels])];
   const routingErrors = useMemo(() => {
     const errors: string[] = [];
     const targets = new Set<string>();
@@ -1476,6 +1553,13 @@ export default function App() {
       if (!target) errors.push(`Fallback chain ${chainIndex + 1} 缺少 target。`);
       else if (targets.has(target)) errors.push(`Fallback target “${target}”重复。`);
       else targets.add(target);
+      const targetProvider = providerForSelector(target);
+      if (targetProvider && shadowedProviders.includes(targetProvider)) {
+        errors.push(`Fallback target “${target}”使用了 shadowed provider “${targetProvider}”。`);
+      }
+      if (isUnavailableModelSelector(target, availableModels)) {
+        errors.push(`Fallback target “${target}”使用了当前 OMP 不可用的模型。`);
+      }
       if (chain.selectors.length === 0) {
         errors.push(`Fallback target “${target || chainIndex + 1}”至少需要一个候选模型。`);
         return;
@@ -1500,10 +1584,15 @@ export default function App() {
         if (provider && shadowedProviders.includes(provider)) {
           errors.push(`Fallback target “${target}”使用了 shadowed provider “${provider}”。`);
         }
+        if (isUnavailableModelSelector(selector, availableModels)) {
+          errors.push(`Fallback target “${target}”使用了当前 OMP 不可用的模型 “${selector}”。`);
+        } else if (modelSelectorError(selector, availableModels, true)) {
+          errors.push(`Fallback target “${target}”使用了无效模型 selector “${selector}”。`);
+        }
       });
     });
     return errors;
-  }, [customRoles, routingSettings.retryFallbackChains, shadowedProviders, values]);
+  }, [availableModels, customRoles, routingSettings.retryFallbackChains, shadowedProviders, values]);
   const hasApplyErrors =
     hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgents.length > 0 || routingErrors.length > 0;
   const hasPresetErrors = hasInvalidSelections || invalidCustomRoles.length > 0 || routingErrors.length > 0;
@@ -1630,7 +1719,7 @@ export default function App() {
     if (!agentEditor || validateAgentMarkdown(agentEditor.agentMarkdown)) return;
     const name = frontmatterField(agentEditor.agentMarkdown, "name");
     const description = frontmatterField(agentEditor.agentMarkdown, "description");
-    const model = frontmatterField(agentEditor.agentMarkdown, "model");
+    const model = firstModelSelector(frontmatterField(agentEditor.agentMarkdown, "model"));
     if (!name || name !== agentEditor.name || !description || !model) return;
     const agent: CustomAgent = {
       fileName: agentEditor.fileName,
@@ -1798,9 +1887,11 @@ export default function App() {
           ? routingErrors[0]
           : invalidCustomRoles.length
             ? "自定义模型 Role 缺少有效模型。"
-            : invalidAgents.length
-              ? "存在无效 Agent Markdown。请打开对应 Agent 修复。"
-          : "存在非法选择：shadowed provider 不能应用。请勾选 Use 或更换 Model。"
+          : invalidAgentMarkdown.length
+            ? "存在无效 Agent Markdown。请打开对应 Agent 修复。"
+            : hasUnavailableSelections || hasUnavailableAgents
+              ? "存在非法选择：已配置模型不在 OMP 当前可用列表中。请更换 Model。"
+              : "存在非法选择：shadowed provider 不能应用。请勾选 Use 或更换 Model。"
       );
       return;
     }
@@ -2154,6 +2245,8 @@ export default function App() {
                   <CustomAgentCard
                     key={agent.fileName}
                     agent={agent}
+                    models={snapshot?.models ?? []}
+                    shadowedProviders={shadowedProviders}
                     onEdit={() => editAgent(agent)}
                   />
                 ))}

@@ -677,6 +677,12 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
 .alias-badge { flex: 0 0 auto; padding: 5px 6px; border-radius: 4px; color: #7652ae; background: #f1eafe; font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace; font-size: 9px; }
 :root[data-theme="dark"] .alias-badge { color: #bca6eb; background: rgba(154, 115, 221, 0.12); }
 .model-picker { min-width: 0; }
+.model-picker-warning {
+  margin: 9px 0 0;
+  color: #a44242;
+  font-size: 11px;
+  line-height: 1.45;
+}
 .model-metadata {
   display: flex;
   flex-wrap: wrap;
@@ -830,3 +836,4 @@ body { font-size: 14px; }
   color: #f0aaaa;
   background: rgba(155, 45, 45, 0.28);
 }
+:root[data-theme="dark"] .model-picker-warning { color: #f0aaaa; }

@@ -879,6 +879,12 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
         }
     }
     for chain in &request.routing_settings.retry_fallback_chains {
+        if selector_provider(&chain.target).is_some_and(|provider| shadowed.contains(provider)) {
+            return Err(format!(
+                "Fallback target “{}”仍使用 shadowed provider",
+                chain.target.trim()
+            ));
+        }
         for selector in &chain.selectors {
             if selector_provider(selector).is_some_and(|provider| shadowed.contains(provider)) {
                 return Err(format!(
