@@ -569,6 +569,7 @@ Fallback 是请求失败或额度恢复策略，不是日常按成本自动降�
 
 ## 10. 维护边界与依据
 
+- **上游源码地址、`pi` 与 `omp` 配置对照、Tier 术语表**：见 [`CLAUDE.md`](CLAUDE.md)（owner 文档，本节不重复维护）。
 - **全局配置**：`~/.omp/agent/config.yml`
 - **用户 Agent 定义**：`~/.omp/agent/agents/*.md`
 - **项目 Agent 定义**：`<project>/.omp/agents/*.md`

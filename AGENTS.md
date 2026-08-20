@@ -1,5 +1,8 @@
 # Repository Guidelines
 
+> Upstream `pi` / `oh-my-pi` source locations, their config file shapes (`~/.omp` vs `~/.pi`), and the
+> pi-agent / Tier glossary are owned by [`CLAUDE.md`](CLAUDE.md) — read it there, don't duplicate it here.
+
 ## Project Overview
 **OMP Model Studio** is a lightweight desktop control plane for [Oh My Pi (`omp`)](https://github.com/can1357/oh-my-pi). It provides a visual interface for managing and previewing:
 - **Built-in & Custom Model Roles**: Configures `modelRoles.*` selectors (e.g. `@slow`, `@smol`, `@tester`) across configured providers and thinking efforts.

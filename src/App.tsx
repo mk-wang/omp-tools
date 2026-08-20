@@ -1,6 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
-import { loadSnapshot, saveSnapshot } from "./api";
-import type { ConfigSnapshot, FallbackChain, ModelOption, RoutingSettings, SaveRequest } from "./types";
+import { discoverCustomProviderModels, loadSnapshot, openConfigFile, saveCustomProviders, saveSnapshot } from "./api";
+import {
+  CUSTOM_PROVIDER_API_OPTIONS,
+  CUSTOM_PROVIDER_PATTERN,
+  CustomProviderModal,
+  customProviderApiOverrides,
+  inferredCustomProviderApi,
+  sortedCustomProviderModels,
+  type CustomProviderEditor
+} from "./CustomProviderModal";
+import type {
+  ConfigSnapshot,
+  CustomProvider,
+  FallbackChain,
+  ModelOption,
+  RoutingSettings,
+  SaveRequest
+} from "./types";
 import "./styles.css";
 
 type SlotKey =
@@ -50,6 +66,8 @@ type AgentEditor = CustomAgent & {
   mode: "create" | "edit";
   originalName: string;
 };
+
+
 
 type Preset = {
   id: string;
@@ -189,6 +207,7 @@ const AGENT_OVERRIDE_KEY_LOOKUP: Record<"reviewer" | "securityReviewer", true> =
   reviewer: true,
   securityReviewer: true
 };
+
 const MODEL_ROLE_DEFINITIONS = SLOT_DEFINITIONS.filter(
   definition => !Object.hasOwn(AGENT_OVERRIDE_KEY_LOOKUP, definition.key)
 );
@@ -212,7 +231,6 @@ const PRESETS_STORAGE_KEY = "omp-model-studio.presets";
 const OMP_PATH_STORAGE_KEY = "omp-model-studio.omp-path";
 const THEME_STORAGE_KEY = "omp-model-studio.theme";
 const CUSTOM_ROLE_PATTERN = /^[a-z][a-z0-9_-]*$/;
-const SHADOWED_PROVIDERS_STORAGE_KEY = "omp-model-studio.shadowed-providers";
 
 const EMPTY_VALUES: SlotValues = {
   default: "",
@@ -264,6 +282,14 @@ function providerForSelector(value: string): string {
   return base.includes("/") ? base.split("/")[0] : "";
 }
 
+
+function modelIdForProviderSelector(value: string, provider: string): string {
+  const base = splitSelector(value).base;
+  const prefix = `${provider}/`;
+  return base.startsWith(prefix) ? base.slice(prefix.length) : "";
+}
+
+
 function isUnavailableModelSelector(value: string, models: ModelOption[]): boolean {
   const parsed = splitSelector(value);
   if (!parsed.base || parsed.alias || !parsed.base.includes("/") || parsed.base.endsWith("/*")) return false;
@@ -314,14 +340,7 @@ function stringList(value: unknown): string[] {
   )];
 }
 
-function readShadowedProviders(): string[] {
-  if (typeof window === "undefined") return [];
-  try {
-    return stringList(JSON.parse(window.localStorage.getItem(SHADOWED_PROVIDERS_STORAGE_KEY) ?? "[]"));
-  } catch {
-    return [];
-  }
-}
+
 function cloneRoutingSettings(settings: RoutingSettings): RoutingSettings {
   return {
     ...settings,
@@ -329,6 +348,92 @@ function cloneRoutingSettings(settings: RoutingSettings): RoutingSettings {
       target: chain.target,
       selectors: [...chain.selectors]
     }))
+  };
+}
+
+/**
+ * Shadowing a provider should feel like OMP's own runtime fallback: move on
+ * to the next candidate immediately, not leave every affected Role flagged
+ * red for manual repair. For each system/custom Role currently pointed at a
+ * newly-shadowed provider, promote the first surviving (non-shadowed)
+ * candidate from that Role's own fallback chain to primary. Roles with no
+ * fallback chain, or whose whole chain is also shadowed, are left invalid —
+ * there is no safe candidate to guess, so those still need a manual pick.
+ * Any chain selector on a shadowed provider is stripped everywhere else too,
+ * since OMP itself would reject a saved config that still references one.
+ */
+function reassignAwayFromShadowedProviders(
+  shadowed: string[],
+  values: SlotValues,
+  customRoles: CustomRole[],
+  routingSettings: RoutingSettings
+): { values: SlotValues; customRoles: CustomRole[]; routingSettings: RoutingSettings; changed: boolean } {
+  const shadowedSet = new Set(shadowed);
+  const isShadowedSelector = (selector: string) => {
+    const provider = providerForSelector(selector);
+    return Boolean(provider) && shadowedSet.has(provider);
+  };
+
+  let chainsChanged = false;
+  const chains = routingSettings.retryFallbackChains
+    .filter(chain => {
+      const targetShadowed = isShadowedSelector(chain.target);
+      if (targetShadowed) chainsChanged = true;
+      return !targetShadowed;
+    })
+    .map(chain => {
+      const selectors = chain.selectors.filter(selector => !isShadowedSelector(selector));
+      if (selectors.length !== chain.selectors.length) chainsChanged = true;
+      return { target: chain.target, selectors };
+    });
+
+  const chainByTarget = new Map(chains.map((chain, index) => [chain.target.trim(), index] as const));
+  const promotedFromChain = new Map<string, string>();
+
+  const promote = (role: string, currentValue: string): string | null => {
+    if (!isShadowedSelector(currentValue)) return null;
+    const chainIndex = chainByTarget.get(role);
+    if (chainIndex === undefined) return null;
+    const candidate = chains[chainIndex].selectors[0];
+    if (!candidate) return null;
+    promotedFromChain.set(role, candidate);
+    return candidate;
+  };
+
+  let valuesChanged = false;
+  const nextValues = { ...values };
+  SYSTEM_MODEL_ROLE_IDS.forEach(role => {
+    const promoted = promote(role, values[role]);
+    if (promoted) {
+      nextValues[role] = promoted;
+      valuesChanged = true;
+    }
+  });
+
+  let customRolesChanged = false;
+  const nextCustomRoles = customRoles.map(customRole => {
+    const promoted = promote(customRole.role, customRole.value);
+    if (!promoted) return customRole;
+    customRolesChanged = true;
+    return { ...customRole, value: promoted };
+  });
+
+  if (promotedFromChain.size > 0) chainsChanged = true;
+  const finalChains = chains
+    .map(chain => {
+      const promoted = promotedFromChain.get(chain.target.trim());
+      if (!promoted) return chain;
+      return { ...chain, selectors: chain.selectors.filter(selector => selector !== promoted) };
+    })
+    .filter(chain => chain.selectors.length > 0);
+
+  return {
+    values: nextValues,
+    customRoles: nextCustomRoles,
+    routingSettings: chainsChanged
+      ? cloneRoutingSettings({ ...routingSettings, retryFallbackChains: finalChains })
+      : routingSettings,
+    changed: valuesChanged || customRolesChanged || chainsChanged
   };
 }
 
@@ -1160,6 +1265,7 @@ function CustomAgentCard({
   );
 }
 
+
 function CustomRoleModal({
   editor,
   models,
@@ -1374,7 +1480,7 @@ function AgentModal({
   );
 }
 
-export default function App() {
+export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   const [snapshot, setSnapshot] = useState<ConfigSnapshot | null>(null);
   const [values, setValues] = useState<SlotValues>(EMPTY_VALUES);
   const [customRoles, setCustomRoles] = useState<CustomRole[]>([]);
@@ -1385,7 +1491,14 @@ export default function App() {
   const [agentEditor, setAgentEditor] = useState<AgentEditor | null>(null);
   const [reviewerFollowsSlow, setReviewerFollowsSlow] = useState(true);
   const [securityReviewerFollowsSlow, setSecurityReviewerFollowsSlow] = useState(true);
-  const [shadowedProviders, setShadowedProviders] = useState<string[]>(readShadowedProviders);
+  const [shadowedProviders, setShadowedProviders] = useState<string[]>([]);
+  const [customProviders, setCustomProviders] = useState<CustomProvider[]>([]);
+  const [customProviderEditor, setCustomProviderEditor] = useState<CustomProviderEditor | null>(null);
+  const [customProviderModelLoading, setCustomProviderModelLoading] = useState(false);
+  const [customProviderModelError, setCustomProviderModelError] = useState("");
+  const [customProviderSaving, setCustomProviderSaving] = useState(false);
+  const [customProviderSaveError, setCustomProviderSaveError] = useState("");
+  const [pendingDeleteCustomProvider, setPendingDeleteCustomProvider] = useState("");
   const [routingSettings, setRoutingSettings] = useState<RoutingSettings>(
     () => cloneRoutingSettings(EMPTY_ROUTING_SETTINGS)
   );
@@ -1414,14 +1527,6 @@ export default function App() {
       // Theme still works for the current session when storage is unavailable.
     }
   }, [theme]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(SHADOWED_PROVIDERS_STORAGE_KEY, JSON.stringify(shadowedProviders));
-    } catch {
-      // Shadow state still applies for the current session when storage is unavailable.
-    }
-  }, [shadowedProviders]);
 
   const applySnapshot = (next: ConfigSnapshot) => {
     const rawReviewer = next.agentModelOverrides.reviewer ?? "";
@@ -1462,7 +1567,15 @@ export default function App() {
     setRemovedModelRoles([]);
     setPendingDeleteCustomRole("");
     setAgentEditor(null);
+    setCustomProviders(next.customProviders);
+    setCustomProviderEditor(null);
+    setCustomProviderModelLoading(false);
+    setCustomProviderModelError("");
+    setCustomProviderSaving(false);
+    setCustomProviderSaveError("");
+    setPendingDeleteCustomProvider("");
     setRoutingSettings(cloneRoutingSettings(next.routingSettings));
+    setShadowedProviders([...next.shadowedProviders].sort((left, right) => left.localeCompare(right)));
     setSnapshot(next);
     setSaved(false);
   };
@@ -1489,13 +1602,28 @@ export default function App() {
     }
   };
 
+  const openEditableFile = async (kind: "config" | "models") => {
+    setError("");
+    try {
+      await openConfigFile(kind);
+    } catch (openError) {
+      setError(readableError(openError));
+    }
+  };
+
   useEffect(() => {
     void refresh();
   }, []);
   const providerNames = useMemo(() => {
+    // `omp models --json` excludes providers already in `disabledProviders` (the
+    // core registry's `getAvailable()` filters them out), so a shadowed provider
+    // would otherwise vanish from this list after Apply and could never be
+    // un-shadowed again. Union with the current shadow set to keep it listed.
     const names = new Set(snapshot?.models.map(model => model.provider) ?? []);
+    shadowedProviders.forEach(provider => names.add(provider));
+    customProviders.forEach(provider => names.add(provider.id));
     return [...names].sort((left, right) => left.localeCompare(right));
-  }, [snapshot]);
+  }, [customProviders, snapshot, shadowedProviders]);
 
   const selectedModelSlots = useMemo(() => {
     const fixedAssignments = SLOT_DEFINITIONS.map(definition => {
@@ -1629,7 +1757,6 @@ export default function App() {
     setRoutingSettings(cloneRoutingSettings(next));
   };
 
-
   const updateCustomRoleValue = (role: string, value: string) => {
     setSaved(false);
     setCustomRoles(current =>
@@ -1646,6 +1773,12 @@ export default function App() {
       ...SYSTEM_MODEL_ROLE_IDS
         .filter(systemRole => values[systemRole].trim() === alias)
         .map(systemRole => `modelRoles.${systemRole}`),
+      ...(!reviewerFollowsSlow && values.reviewer.trim() === alias
+        ? ["task.agentModelOverrides.reviewer"]
+        : []),
+      ...(!securityReviewerFollowsSlow && values.securityReviewer.trim() === alias
+        ? ["task.agentModelOverrides.security-reviewer"]
+        : []),
       ...customRoles
         .filter(customRole => customRole.role !== role && customRole.value.trim() === alias)
         .map(customRole => `modelRoles.${customRole.role}`),
@@ -1694,6 +1827,247 @@ export default function App() {
     setPendingDeleteCustomRole("");
     setRoleEditor(null);
     setSaved(false);
+  };
+
+  const startCustomProvider = () => {
+    setError("");
+    setCustomProviderModelError("");
+    setCustomProviderSaveError("");
+    setCustomProviderModelLoading(false);
+    setCustomProviderEditor({
+      mode: "create",
+      originalId: "",
+      id: "",
+      baseUrl: "",
+      api: "openai-completions",
+      apiKey: "",
+      apiKeyConfigured: false,
+      authNone: false,
+      models: [],
+      modelApiOverrides: {},
+      availableModels: []
+    });
+  };
+
+  const discoverProviderModels = async (editor: CustomProviderEditor) => {
+    setCustomProviderModelLoading(true);
+    setCustomProviderModelError("");
+    try {
+      const models = sortedCustomProviderModels(await discoverCustomProviderModels({
+        providerId: editor.id.trim(),
+        baseUrl: editor.baseUrl.trim(),
+        api: editor.api,
+        apiKey: editor.apiKey.trim() || null
+      }));
+      setCustomProviderEditor(current => {
+        if (
+          !current
+          || current.mode !== editor.mode
+          || current.originalId !== editor.originalId
+          || current.id !== editor.id
+          || current.baseUrl !== editor.baseUrl
+          || current.api !== editor.api
+          || current.apiKey !== editor.apiKey
+        ) {
+          return current;
+        }
+        const modelIds = new Set(models.map(model => model.id));
+        const staleSelectedModels = current.models
+          .filter(id => !modelIds.has(id))
+          .map(id => ({ id, name: id }));
+        const modelApiOverrides = { ...current.modelApiOverrides };
+        models.forEach(model => {
+          if (model.api && model.api !== current.api && !Object.hasOwn(modelApiOverrides, model.id)) {
+            modelApiOverrides[model.id] = model.api;
+          }
+        });
+        return {
+          ...current,
+          modelApiOverrides,
+          availableModels: sortedCustomProviderModels([...models, ...staleSelectedModels])
+        };
+      });
+      if (models.length === 0) {
+        setCustomProviderModelError("provider 返回了空的 model 列表。");
+      }
+    } catch (discoveryError) {
+      setCustomProviderModelError(readableError(discoveryError));
+    } finally {
+      setCustomProviderModelLoading(false);
+    }
+  };
+
+  const persistCustomProviders = async (
+    providers: CustomProvider[],
+    removedProviderIds: string[],
+    updatedApiKey?: { id: string; value: string }
+  ): Promise<boolean> => {
+    setCustomProviderSaving(true);
+    setCustomProviderSaveError("");
+    try {
+      const savedProviders = await saveCustomProviders({
+        customProviders: providers.map(provider => ({
+          id: provider.id,
+          baseUrl: provider.baseUrl,
+          api: provider.api,
+          apiKey: updatedApiKey?.id === provider.id && updatedApiKey.value ? updatedApiKey.value : null,
+          models: provider.models.map(model => ({
+            id: model.id,
+            api: model.api?.trim() || provider.api,
+            thinking: model.thinking ?? [],
+            defaultThinkingLevel: model.defaultThinkingLevel ?? null
+          }))
+        })),
+        removedCustomProviders: removedProviderIds
+      });
+      setCustomProviders(savedProviders);
+      setSnapshot(current => current ? { ...current, customProviders: savedProviders } : current);
+      return true;
+    } catch (saveError) {
+      const message = readableError(saveError);
+      setCustomProviderSaveError(message);
+      setError(message);
+      return false;
+    } finally {
+      setCustomProviderSaving(false);
+    }
+  };
+
+  const editCustomProvider = (provider: CustomProvider) => {
+    setError("");
+    setCustomProviderModelError("");
+    setCustomProviderSaveError("");
+    setCustomProviderModelLoading(false);
+    const availableModels = sortedCustomProviderModels(provider.models);
+    const api = inferredCustomProviderApi(
+      provider.api,
+      availableModels,
+      CUSTOM_PROVIDER_API_OPTIONS[0].value
+    );
+    setCustomProviderEditor({
+      mode: "edit",
+      originalId: provider.id,
+      id: provider.id,
+      baseUrl: provider.baseUrl,
+      api,
+      apiKey: "",
+      apiKeyConfigured: provider.apiKeyConfigured,
+      authNone: provider.authNone,
+      models: availableModels.map(model => model.id),
+      modelApiOverrides: customProviderApiOverrides(availableModels, api),
+      availableModels
+    });
+  };
+
+  const saveCustomProvider = async () => {
+    if (!customProviderEditor || customProviderSaving) return;
+    const editor = customProviderEditor;
+    const id = editor.id.trim();
+    const selectedModels = new Set(editor.models);
+    const duplicate = editor.mode === "create" && customProviders.some(provider => provider.id === id);
+    const validationError = !id
+      ? "请输入 provider ID。"
+      : !CUSTOM_PROVIDER_PATTERN.test(id)
+        ? "Provider ID 格式无效。"
+        : duplicate
+          ? "该 provider 已存在。"
+          : !/^https?:\/\/\S+$/i.test(editor.baseUrl.trim())
+            ? "Base URL 必须以 http:// 或 https:// 开头。"
+            : !CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === editor.api)
+              ? "请选择 OMP 支持的 Type。"
+              : editor.models.some(modelId => {
+                  const api = editor.modelApiOverrides[modelId]?.trim() || editor.api;
+                  return !CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === api);
+                })
+                ? "请选择每个 model 支持的 Type。"
+                : !editor.apiKey.trim() && !editor.apiKeyConfigured && !editor.authNone
+                  ? "请输入 API key。"
+                  : editor.availableModels.length === 0
+                    ? "请先获取 provider 返回的 model 列表。"
+                    : editor.models.length === 0
+                      ? "至少勾选一个 model。"
+                      : "";
+    if (validationError) {
+      setCustomProviderSaveError(validationError);
+      return;
+    }
+    const missingReferences = [
+      ...selectedModelSlots
+        .filter(item => providerForSelector(item.value) === id)
+        .filter(item => {
+          const modelId = modelIdForProviderSelector(item.value, id);
+          return modelId === "*" || !selectedModels.has(modelId);
+        })
+        .map(item => item.label),
+      ...customAgents
+        .filter(agent => providerForSelector(agent.model) === id)
+        .filter(agent => !selectedModels.has(modelIdForProviderSelector(agent.model, id)))
+        .map(agent => `Agent ${agent.name}`)
+    ];
+    if (missingReferences.length > 0) {
+      setCustomProviderSaveError(`不能取消使用 provider “${id}”的 model；仍被 ${missingReferences.join("、")} 引用。`);
+      return;
+    }
+
+    const apiKey = editor.apiKey.trim();
+    const availableById = new Map(editor.availableModels.map(model => [model.id, model]));
+    const nextProvider: CustomProvider = {
+      id,
+      baseUrl: editor.baseUrl.trim(),
+      api: editor.api,
+      apiKeyConfigured: Boolean(apiKey) || editor.apiKeyConfigured,
+      authNone: editor.authNone && !apiKey,
+      models: sortedCustomProviderModels(
+        editor.models.map(modelId => {
+          const model = availableById.get(modelId) ?? { id: modelId, name: modelId };
+          return {
+            ...model,
+            api: editor.modelApiOverrides[modelId]?.trim() || editor.api
+          };
+        })
+      )
+    };
+    const nextProviders = editor.mode === "create"
+      ? [...customProviders, nextProvider].sort((left, right) => left.id.localeCompare(right.id))
+      : customProviders.map(provider => provider.id === editor.originalId ? nextProvider : provider);
+    const saved = await persistCustomProviders(
+      nextProviders,
+      [],
+      apiKey ? { id, value: apiKey } : undefined
+    );
+    if (!saved) return;
+    setPendingDeleteCustomProvider("");
+    setCustomProviderEditor(null);
+    setError("");
+  };
+
+  const removeCustomProvider = async (id: string) => {
+    if (customProviderSaving) return;
+    if (pendingDeleteCustomProvider !== id) {
+      setPendingDeleteCustomProvider(id);
+      return;
+    }
+    const references = [
+      ...selectedModelSlots
+        .filter(item => providerForSelector(item.value) === id)
+        .map(item => item.label),
+      ...customAgents
+        .filter(agent => providerForSelector(agent.model) === id)
+        .map(agent => `Agent ${agent.name}`)
+    ];
+    if (references.length > 0) {
+      setPendingDeleteCustomProvider("");
+      setError(`不能移除 provider “${id}”；仍被 ${references.join("、")} 使用。`);
+      return;
+    }
+    const saved = await persistCustomProviders(
+      customProviders.filter(provider => provider.id !== id),
+      [id]
+    );
+    if (!saved) return;
+    setPendingDeleteCustomProvider("");
+    setCustomProviderEditor(null);
+    setError("");
   };
 
   const startAgent = () => {
@@ -1750,10 +2124,19 @@ export default function App() {
 
   const toggleProvider = (provider: string, shadow: boolean) => {
     setSaved(false);
-    setShadowedProviders(current => {
-      if (shadow) return current.includes(provider) ? current : [...current, provider].sort((left, right) => left.localeCompare(right));
-      return current.filter(item => item !== provider);
-    });
+    if (!shadow) {
+      setShadowedProviders(current => current.filter(item => item !== provider));
+      return;
+    }
+    if (shadowedProviders.includes(provider)) return;
+    const nextShadowed = [...shadowedProviders, provider].sort((left, right) => left.localeCompare(right));
+    setShadowedProviders(nextShadowed);
+    const reassigned = reassignAwayFromShadowedProviders(nextShadowed, values, customRoles, routingSettings);
+    if (reassigned.changed) {
+      setValues(reassigned.values);
+      setCustomRoles(reassigned.customRoles);
+      setRoutingSettings(reassigned.routingSettings);
+    }
   };
 
   const persistPresetList = (next: Preset[]) => {
@@ -1957,10 +2340,22 @@ export default function App() {
           </div>
         </div>
         <div className="header-actions">
+          <div className="tool-switcher">
+            <button className="tool-tab is-active">OMP</button>
+            <button className="tool-tab" onClick={onSwitchTool}>Pi</button>
+          </div>
           <div className="config-status">
             <span className="status-dot" />
             {snapshot?.configPath ?? "~/.omp/agent/config.yml"}
           </div>
+          <button
+            className="button quiet"
+            onClick={() => void openEditableFile("config")}
+            disabled={saving}
+            title="使用系统默认编辑器打开 config.yml"
+          >
+            直接编辑
+          </button>
           <button className="button quiet" onClick={() => setTheme(theme === "light" ? "dark" : "light")}>
             {theme === "light" ? "☾ Dark" : "☀ Light"}
           </button>
@@ -2064,12 +2459,65 @@ export default function App() {
             </p>
           </section>
 
+          <section className="provider-card custom-provider-card">
+            <div className="custom-provider-heading">
+              <div className="catalog-heading"><span>CUSTOM PROVIDERS</span><strong>{customProviders.length}</strong></div>
+              <div className="custom-provider-heading-actions">
+                <button
+                  className="button compact quiet"
+                  onClick={() => void openEditableFile("models")}
+                  disabled={customProviderSaving}
+                  title="使用系统默认编辑器打开 models.yml"
+                >
+                  直接编辑
+                </button>
+                <button className="button compact" onClick={startCustomProvider} disabled={customProviderSaving}>
+                  新增 Provider
+                </button>
+              </div>
+            </div>
+            <p className="provider-help">Provider 保存后立即写入 ~/.omp/agent/models.yml，不需要窗口右上角的 Apply。也可以直接编辑文件，保存后点击“重新读取”。API key 不会从已有文件回显；留空表示保留原 key。</p>
+            <div className="custom-provider-list">
+              {customProviders.map(provider => (
+                <div className="custom-provider-row" key={provider.id}>
+                  <div className="custom-provider-summary">
+                    <span className="custom-provider-name">{provider.id}</span>
+                    <span className="custom-provider-meta">
+                      {provider.api || "type missing"} · {provider.models.length} models ·
+                      {" "}{provider.apiKeyConfigured ? "API key configured" : provider.authNone ? "keyless" : "API key missing"}
+                    </span>
+                  </div>
+                  <div className="custom-provider-actions">
+                    <button
+                      className="button compact"
+                      onClick={() => editCustomProvider(provider)}
+                      disabled={customProviderSaving}
+                    >
+                      编辑
+                    </button>
+                    <button
+                      className="button compact danger"
+                      onClick={() => void removeCustomProvider(provider.id)}
+                      disabled={customProviderSaving}
+                      aria-label={pendingDeleteCustomProvider === provider.id ? `Confirm delete ${provider.id}` : `Delete ${provider.id}`}
+                    >
+                      {pendingDeleteCustomProvider === provider.id ? "确认删除" : "删除"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {customProviders.length === 0 && (
+                <div className="empty-state">尚未配置 custom provider。</div>
+              )}
+            </div>
+          </section>
+
           <section className="provider-card">
             <div className="catalog-heading"><span>PROVIDER LIST</span><strong>{providerNames.length}</strong></div>
-            <p className="provider-help">列表来自 OMP 当前可用模型；取消 Use 只在本应用中 shadow provider，Apply 仍会拒绝使用其模型的路由。</p>
+            <p className="provider-help">列表来自 OMP 当前可用模型；取消 Use 会立即把受影响 Role 切换到各自 fallback chain 中下一个可用候选，Apply 时写入 OMP 真实的 disabledProviders。没有可用候选的 Role 会保持标红，需要手动选择。</p>
             <div className="provider-key">
               <span><i className="key-mark used-mark" /> Used by roles</span>
-              <span><i className="key-mark shadowed-mark" /> Shadowed locally</span>
+              <span><i className="key-mark shadowed-mark" /> Shadowed · will disable in OMP</span>
             </div>
             <div className="provider-list">
               {providerNames.map(provider => {
@@ -2197,6 +2645,7 @@ export default function App() {
               ))}
             </div>
           </section>
+
           <section className="custom-role-section">
             <div className="custom-role-heading">
               <div>
@@ -2269,6 +2718,31 @@ export default function App() {
           {error && <div className="inline-error">{error}</div>}
         </main>
       </div>
+      {customProviderEditor && (
+        <CustomProviderModal
+          apiOptions={CUSTOM_PROVIDER_API_OPTIONS}
+          productName="OMP"
+          destinationPath="~/.omp/agent/models.yml"
+          requireApiKey
+          editor={customProviderEditor}
+          existingProviderIds={customProviders.map(provider => provider.id)}
+          discovering={customProviderModelLoading}
+          discoveryError={customProviderModelError}
+          saving={customProviderSaving}
+          saveError={customProviderSaveError}
+          onChange={editor => {
+            setCustomProviderSaveError("");
+            setCustomProviderEditor(editor);
+          }}
+          onDiscover={() => {
+            if (customProviderEditor) void discoverProviderModels(customProviderEditor);
+          }}
+          onCancel={() => {
+            if (!customProviderSaving) setCustomProviderEditor(null);
+          }}
+          onSave={() => void saveCustomProvider()}
+        />
+      )}
       {roleEditor && (
         <CustomRoleModal
           editor={roleEditor}
