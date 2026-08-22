@@ -177,7 +177,6 @@ struct ConfigSnapshot {
     model_source: String,
     agent_files: Vec<AgentDefinitionFile>,
     routing_settings: RoutingSettings,
-    shadowed_providers: Vec<String>,
     custom_providers: Vec<CustomProvider>,
     warnings: Vec<String>,
 }
@@ -196,7 +195,6 @@ struct SaveRequest {
     removed_model_roles: Vec<String>,
     agent_model_overrides: BTreeMap<String, String>,
     agent_files: Vec<AgentFileSave>,
-    shadowed_providers: Vec<String>,
     routing_settings: RoutingSettings,
     omp_path: Option<String>,
 }
@@ -935,41 +933,6 @@ fn set_nested_fallback_chains(root: &mut YamlValue, path: &[&str], chains: &[Fal
     set_nested_value(root, path, value);
 }
 
-/// `disabledProviders` entries are either plain provider-id strings (global) or
-/// path-scoped mapping objects (`{path: ..., providers: [...]}`, see OMP's
-/// `PATH_SCOPED_ARRAY_SETTINGS`). Model Studio only manages the global string
-/// subset via the shadow toggle; path-scoped entries are preserved verbatim so
-/// scopes configured outside this app are never dropped on Apply.
-fn set_nested_disabled_providers(root: &mut YamlValue, path: &[&str], shadowed: &[String]) {
-    let scoped_entries: Vec<YamlValue> = nested_value(root, path)
-        .and_then(YamlValue::as_sequence)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|entry| !matches!(entry, YamlValue::String(_)))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut globals: Vec<String> = shadowed
-        .iter()
-        .map(|provider| provider.trim().to_string())
-        .filter(|provider| !provider.is_empty())
-        .collect();
-    globals.sort();
-    globals.dedup();
-
-    let mut sequence: Vec<YamlValue> = globals.into_iter().map(YamlValue::String).collect();
-    sequence.extend(scoped_entries);
-
-    let value = if sequence.is_empty() {
-        None
-    } else {
-        Some(YamlValue::Sequence(sequence))
-    };
-    set_nested_value(root, path, value);
-}
 
 fn valid_custom_provider_id(id: &str) -> bool {
     let mut characters = id.chars();
@@ -1900,7 +1863,6 @@ fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapsh
         _ => None,
     });
     let agent_model_overrides = nested_string_map(&root, &["task", "agentModelOverrides"]);
-    let shadowed_providers = string_list(nested_value(&root, &["disabledProviders"]));
     let routing_settings = RoutingSettings {
         default_thinking_level: optional_string(&root, &["defaultThinkingLevel"]),
         auto_thinking_max_effort: optional_string(&root, &["providers", "autoThinkingMaxEffort"]),
@@ -1926,7 +1888,6 @@ fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapsh
         model_source: "omp models --json".to_string(),
         agent_files,
         routing_settings,
-        shadowed_providers,
         custom_providers: load_custom_providers(&models_root),
         warnings,
     })
@@ -2056,28 +2017,21 @@ struct PiModelOption {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PiTier {
+    /// Complete `provider/model-id:thinking` spec for the primary attempt.
     model: String,
-    thinking: String,
     #[serde(default)]
+    /// Complete model specs tried after the primary, each with its own thinking suffix.
     fallback_models: Vec<String>,
-    /// Free-text note on when to reach for this tier (e.g. "quick lookups,
-    /// recon, mechanical edits"). Studio-only metadata: pi-roster's own tier
-    /// schema doesn't define this field but tolerates it — validation only
-    /// checks the keys it cares about, so it round-trips harmlessly.
-    #[serde(default)]
-    use_case: String,
 }
 
 fn default_max_recursion_depth() -> i64 {
     2
 }
 
-/// Shape of the `"pi-roster"` block in `~/.pi/agent/settings.json`, written
-/// and read whole — pi-roster resolves tiers/assignments/disabledAgents/
-/// maxRecursionDepth directly from this block at dispatch time. There is no
-/// separate tiers file and no expansion into a different settings key (that
-/// was pi-subagents' `apply-tiers.mjs`/`subagents.agentOverrides` model,
-/// which pi-roster does not use).
+/// Studio's UI-facing model tier shape. The persisted pi-roster block uses
+/// `defaultModelProfile` and `modelProfiles`; conversion helpers below keep
+/// that external contract at the settings boundary while preserving the
+/// existing Tier-oriented UI model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PiTiersFile {
@@ -2107,6 +2061,74 @@ impl Default for PiTiersFile {
             disabled_agents: Vec::new(),
             max_recursion_depth: default_max_recursion_depth(),
         }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PiRosterProfile {
+    model: String,
+    #[serde(default)]
+    fallback_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiRosterConfig {
+    #[serde(default)]
+    default_model_profile: String,
+    #[serde(default)]
+    model_profiles: BTreeMap<String, PiRosterProfile>,
+    #[serde(default)]
+    assignments: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    disabled_agents: Vec<String>,
+    #[serde(default = "default_max_recursion_depth")]
+    max_recursion_depth: i64,
+}
+
+fn pi_roster_config_to_pi_tiers(config: PiRosterConfig) -> PiTiersFile {
+    let tiers = config
+        .model_profiles
+        .into_iter()
+        .map(|(name, profile)| {
+            (
+                name,
+                PiTier {
+                    model: profile.model,
+                    fallback_models: profile.fallback_models,
+                },
+            )
+        })
+        .collect();
+    PiTiersFile {
+        default: config.default_model_profile,
+        tiers,
+        assignments: config.assignments,
+        disabled_agents: config.disabled_agents,
+        max_recursion_depth: config.max_recursion_depth,
+    }
+}
+
+fn pi_tiers_to_roster_config(tiers: &PiTiersFile) -> PiRosterConfig {
+    let model_profiles = tiers
+        .tiers
+        .iter()
+        .map(|(name, tier)| {
+            (
+                name.clone(),
+                PiRosterProfile {
+                    model: tier.model.clone(),
+                    fallback_models: tier.fallback_models.clone(),
+                },
+            )
+        })
+        .collect();
+    PiRosterConfig {
+        default_model_profile: tiers.default.clone(),
+        model_profiles,
+        assignments: tiers.assignments.clone(),
+        disabled_agents: tiers.disabled_agents.clone(),
+        max_recursion_depth: tiers.max_recursion_depth,
     }
 }
 
@@ -2265,18 +2287,18 @@ fn discover_pi_agent_names(agent: &Path) -> Vec<String> {
 const ROSTER_CONFIG_KEY: &str = "pi-roster";
 
 /// Extracts and parses the `"pi-roster"` block from an already-loaded
-/// settings map. pi-roster reads this block directly at dispatch time —
-/// there is no separate tiers file to read (see `PiTiersFile`'s doc comment).
+/// settings map. The persisted keys follow pi-roster's model-profile schema;
+/// the result is translated into the Studio-facing Tier shape.
 fn load_pi_roster_config(
     settings: &serde_json::Map<String, JsonValue>,
 ) -> Result<(PiTiersFile, bool), String> {
     let Some(block) = settings.get(ROSTER_CONFIG_KEY) else {
         return Ok((PiTiersFile::default(), false));
     };
-    let parsed: PiTiersFile = serde_json::from_value(block.clone()).map_err(|error| {
+    let parsed: PiRosterConfig = serde_json::from_value(block.clone()).map_err(|error| {
         format!("解析 settings.json 中的 “{ROSTER_CONFIG_KEY}” 配置块失败: {error}")
     })?;
-    Ok((parsed, true))
+    Ok((pi_roster_config_to_pi_tiers(parsed), true))
 }
 
 /// `pi`'s settings.json shares the same coding-agent core as OMP's config.yml,
@@ -2516,66 +2538,81 @@ fn load_pi_snapshot_from_disk(custom_pi_path: Option<&str>) -> Result<PiSnapshot
     })
 }
 
-/// A recognized `:thinking` suffix on a model selector, using the same
-/// detection pi-roster's own `splitKnownThinkingSuffix` uses (a trailing `:`
-/// plus one of the seven known thinking levels).
-fn selector_has_thinking_suffix(selector: &str) -> bool {
-    selector
-        .trim()
-        .rsplit_once(':')
-        .is_some_and(|(_, suffix)| THINKING_LEVELS.contains(&suffix))
+fn valid_pi_roster_model_spec(selector: &str) -> bool {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() || trimmed.starts_with('@') {
+        return false;
+    }
+    let Some((base_model, thinking)) = trimmed.rsplit_once(':') else {
+        return false;
+    };
+    if !THINKING_LEVELS.contains(&thinking) {
+        return false;
+    }
+    let Some((provider, model_id)) = base_model.split_once('/') else {
+        return false;
+    };
+    !provider.is_empty() && !model_id.is_empty()
 }
 
 fn validate_pi_tiers(tiers: &PiTiersFile, shadowed: &HashSet<&str>) -> Result<(), String> {
-    if !tiers.tiers.is_empty()
-        && !tiers.default.trim().is_empty()
-        && !tiers.tiers.contains_key(&tiers.default)
-    {
-        return Err(format!("default tier “{}”不存在", tiers.default));
+    if tiers.tiers.is_empty() {
+        return Err("至少需要一个 model profile".to_string());
     }
+    let default_profile = tiers.default.trim();
+    if default_profile.is_empty() {
+        return Err("必须设置 default model profile".to_string());
+    }
+    if !tiers.tiers.contains_key(default_profile) {
+        return Err(format!("default model profile “{}”不存在", tiers.default));
+    }
+
     for (tier_name, tier) in &tiers.tiers {
-        if tier.model.trim().is_empty() {
-            return Err(format!("Tier “{tier_name}”缺少主模型"));
+        if tier_name.trim().is_empty() {
+            return Err("model profile 名称不能为空".to_string());
         }
-        // pi-roster fails closed on a `:thinking` suffix in `model` — the
-        // separate `thinking` field is the only source, on purpose (see
-        // pi-roster's DESIGN.md §8, "one source, not two with a precedence
-        // rule"). Reject it here too so Studio never writes a config that
-        // pi-roster itself would then refuse to load.
-        if selector_has_thinking_suffix(&tier.model) {
+        if !valid_pi_roster_model_spec(&tier.model) {
             return Err(format!(
-                "Tier “{tier_name}”的主模型不能带 “:thinking” 后缀，请用下面的 Thinking 字段"
+                "Model profile “{tier_name}”的主模型必须是 provider/model-id:thinking 格式"
             ));
-        }
-        if !THINKING_LEVELS.contains(&tier.thinking.as_str()) {
-            return Err(format!("Tier “{tier_name}”的 thinking 不是合法值"));
         }
         if selector_provider(&tier.model).is_some_and(|provider| shadowed.contains(provider)) {
             return Err(format!(
-                "Tier “{tier_name}”的主模型仍使用 shadowed provider"
+                "Model profile “{tier_name}”的主模型仍使用 shadowed provider"
             ));
         }
         for selector in &tier.fallback_models {
-            if selector_has_thinking_suffix(selector) {
+            if !valid_pi_roster_model_spec(selector) {
                 return Err(format!(
-                    "Tier “{tier_name}”的 fallback 不能带 “:thinking” 后缀"
+                    "Model profile “{tier_name}”的 fallback 必须是 provider/model-id:thinking 格式"
                 ));
             }
             if selector_provider(selector).is_some_and(|provider| shadowed.contains(provider)) {
                 return Err(format!(
-                    "Tier “{tier_name}”的 fallback 仍使用 shadowed provider"
+                    "Model profile “{tier_name}”的 fallback 仍使用 shadowed provider"
                 ));
             }
         }
     }
+
     let mut seen_agents = HashSet::new();
     for (tier_name, agents) in &tiers.assignments {
         if !tiers.tiers.contains_key(tier_name) {
-            return Err(format!("assignments 引用了不存在的 tier “{tier_name}”"));
+            return Err(format!(
+                "assignments 引用了不存在的 model profile “{tier_name}”"
+            ));
         }
+        let mut seen_in_profile = HashSet::new();
         for agent in agents {
-            if !seen_agents.insert(agent.clone()) {
-                return Err(format!("Agent “{agent}”被分配到多个 tier"));
+            let agent_name = agent.trim();
+            if agent_name.is_empty() {
+                return Err(format!("assignments.{tier_name} 包含空 Agent 名称"));
+            }
+            if !seen_in_profile.insert(agent_name.to_string()) {
+                continue;
+            }
+            if !seen_agents.insert(agent_name.to_string()) {
+                return Err(format!("Agent “{agent_name}”被分配到多个 model profile"));
             }
         }
     }
@@ -2604,12 +2641,13 @@ fn save_pi_tiers(
     let mut settings = load_pi_settings_map(&settings_path)?;
     set_json_disabled_providers(&mut settings, &shadowed_providers);
 
-    // Write the whole block verbatim — pi-roster reads `"pi-roster"` directly
-    // at dispatch time, so there is no separate expansion step (unlike
-    // pi-subagents' tiers.json -> settings.json.subagents.agentOverrides).
-    let tiers_value = serde_json::to_value(&tiers)
+    // Pi-roster reads the model-profile block directly. Translate the
+    // Studio's Tier-oriented editing model at this persistence boundary
+    // instead of writing the obsolete `default`/`tiers` keys.
+    let roster_config = pi_tiers_to_roster_config(&tiers);
+    let roster_value = serde_json::to_value(&roster_config)
         .map_err(|error| format!("序列化 “{ROSTER_CONFIG_KEY}” 配置块失败: {error}"))?;
-    settings.insert(ROSTER_CONFIG_KEY.to_string(), tiers_value);
+    settings.insert(ROSTER_CONFIG_KEY.to_string(), roster_value);
 
     let settings_json = serde_json::to_string_pretty(&JsonValue::Object(settings))
         .map_err(|error| format!("序列化 settings.json 失败: {error}"))?;
@@ -2840,36 +2878,6 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
 
     validate_routing_settings(&request.routing_settings)?;
 
-    let shadowed = request
-        .shadowed_providers
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    for (label, selector) in request
-        .model_roles
-        .iter()
-        .chain(request.agent_model_overrides.iter())
-    {
-        if selector_provider(selector).is_some_and(|provider| shadowed.contains(provider)) {
-            return Err(format!("“{label}”仍使用 shadowed provider"));
-        }
-    }
-    for chain in &request.routing_settings.retry_fallback_chains {
-        if selector_provider(&chain.target).is_some_and(|provider| shadowed.contains(provider)) {
-            return Err(format!(
-                "Fallback target “{}”仍使用 shadowed provider",
-                chain.target.trim()
-            ));
-        }
-        for selector in &chain.selectors {
-            if selector_provider(selector).is_some_and(|provider| shadowed.contains(provider)) {
-                return Err(format!(
-                    "Fallback target “{}”仍使用 shadowed provider",
-                    chain.target.trim()
-                ));
-            }
-        }
-    }
 
     let mut seen_files = HashSet::new();
     let mut seen_agent_names = HashSet::new();
@@ -2964,11 +2972,6 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
         &mut root,
         &["retry", "fallbackRevertPolicy"],
         routing.retry_fallback_revert_policy.as_deref(),
-    );
-    set_nested_disabled_providers(
-        &mut root,
-        &["disabledProviders"],
-        &request.shadowed_providers,
     );
     write_yaml_atomically(&config, &root)?;
     load_snapshot_from_disk(request.omp_path.as_deref())
@@ -3093,7 +3096,6 @@ mod tests {
                 file_name: "release-coordinator.md".to_string(),
                 agent_markdown: "---\nname: release-coordinator\ndescription: Release verification agent.\nmodel: \"@slow\"\n---\n\nRun the release verification workflow.\n".to_string(),
             }],
-            shadowed_providers: vec!["mistral".to_string()],
             routing_settings: RoutingSettings {
                 default_thinking_level: Some("auto".to_string()),
                 auto_thinking_max_effort: Some("xhigh".to_string()),
@@ -3159,11 +3161,6 @@ mod tests {
             snapshot.routing_settings.retry_fallback_chains[0].selectors,
             vec!["openai/fallback:xhigh".to_string()]
         );
-        assert_eq!(
-            snapshot.shadowed_providers,
-            vec!["mistral".to_string()],
-            "shadowed providers must round-trip through OMP's real disabledProviders"
-        );
         let agent_markdown = fs::read_to_string(agent.join("agents/release-coordinator.md"))
             .expect("independent agent markdown should be written");
         assert!(agent_markdown.contains("model: \"@slow\""));
@@ -3190,8 +3187,8 @@ mod tests {
         );
         assert_eq!(
             string_list(parsed.get("disabledProviders")),
-            vec!["mistral".to_string()],
-            "shadow toggles must write through to OMP's real disabledProviders, fully replacing the prior global entries"
+            vec!["ollama".to_string()],
+            "Apply must preserve OMP's existing disabledProviders; provider shadow is UI-local"
         );
         let disabled_providers = parsed
             .get("disabledProviders")
@@ -3754,8 +3751,7 @@ mod tests {
         tiers.insert(
             "fast".to_string(),
             PiTier {
-                model: "openai-codex/gpt-5.6-luna".to_string(),
-                thinking: "low".to_string(),
+                model: "openai-codex/gpt-5.6-luna:low".to_string(),
                 fallback_models: vec![],
                 ..Default::default()
             },
@@ -3776,8 +3772,7 @@ mod tests {
         tiers.insert(
             "also-fast".to_string(),
             PiTier {
-                model: "openai-codex/gpt-5.5".to_string(),
-                thinking: "low".to_string(),
+                model: "openai-codex/gpt-5.5:low".to_string(),
                 fallback_models: vec![],
                 ..Default::default()
             },
@@ -3797,9 +3792,8 @@ mod tests {
         tiers.insert(
             "fast".to_string(),
             PiTier {
-                model: "mistral/small".to_string(),
-                thinking: "low".to_string(),
-                fallback_models: vec![],
+                model: "mistral/small:low".to_string(),
+                fallback_models: vec!["openai/gpt:high".to_string()],
                 ..Default::default()
             },
         );
@@ -3811,50 +3805,118 @@ mod tests {
         };
         let shadowed: HashSet<&str> = HashSet::from(["mistral"]);
         assert!(validate_pi_tiers(&data, &shadowed).is_err());
+
+        let mut fallback_shadowed = data;
+        fallback_shadowed.tiers.get_mut("fast").unwrap().model = "openai/gpt:high".to_string();
+        fallback_shadowed
+            .tiers
+            .get_mut("fast")
+            .unwrap()
+            .fallback_models = vec!["mistral/backup:low".to_string()];
+        assert!(validate_pi_tiers(&fallback_shadowed, &shadowed).is_err());
     }
 
     #[test]
-    fn validate_pi_tiers_rejects_thinking_suffix_on_model_and_invalid_thinking() {
+    fn validate_pi_tiers_rejects_missing_or_unknown_thinking_suffixes() {
         let no_shadow: HashSet<&str> = HashSet::new();
+        for invalid_model in [
+            "openai-codex/gpt-5.6-luna",
+            "openai-codex/gpt-5.6-luna:urgent",
+        ] {
+            let mut tiers = BTreeMap::new();
+            tiers.insert(
+                "fast".to_string(),
+                PiTier {
+                    model: invalid_model.to_string(),
+                    fallback_models: vec![],
+                    ..Default::default()
+                },
+            );
+            let invalid = PiTiersFile {
+                default: "fast".to_string(),
+                tiers,
+                assignments: BTreeMap::new(),
+                ..Default::default()
+            };
+            assert!(validate_pi_tiers(&invalid, &no_shadow).is_err());
+        }
 
-        let mut suffixed = BTreeMap::new();
-        suffixed.insert(
+        let mut tiers = BTreeMap::new();
+        tiers.insert(
             "fast".to_string(),
             PiTier {
                 model: "openai-codex/gpt-5.6-luna:high".to_string(),
-                thinking: "low".to_string(),
-                fallback_models: vec![],
+                fallback_models: vec!["kimi-coding/k3".to_string()],
                 ..Default::default()
             },
         );
-        let suffixed_model = PiTiersFile {
+        let invalid_fallback = PiTiersFile {
             default: "fast".to_string(),
-            tiers: suffixed,
+            tiers,
             assignments: BTreeMap::new(),
             ..Default::default()
         };
-        assert!(
-            validate_pi_tiers(&suffixed_model, &no_shadow).is_err(),
-            "pi-roster fails closed on a :thinking suffix in model — thinking has exactly one source"
-        );
+        assert!(validate_pi_tiers(&invalid_fallback, &no_shadow).is_err());
+    }
 
-        let mut bad_thinking = BTreeMap::new();
-        bad_thinking.insert(
-            "fast".to_string(),
-            PiTier {
-                model: "openai-codex/gpt-5.6-luna".to_string(),
-                thinking: "urgent".to_string(),
-                fallback_models: vec![],
-                ..Default::default()
-            },
+    #[test]
+    fn load_pi_roster_config_reads_model_owned_thinking_schema() {
+        let settings: serde_json::Map<String, JsonValue> = serde_json::from_str(
+            r#"{
+                "pi-roster": {
+                    "defaultModelProfile": "standard",
+                    "modelProfiles": {
+                        "standard": {
+                            "model": "openai-codex/gpt-5.6-luna:high",
+                            "fallbackModels": ["kimi-coding/k3:medium"]
+                        }
+                    },
+                    "assignments": {"standard": ["reviewer"]},
+                    "disabledAgents": ["worker"],
+                    "maxRecursionDepth": -1
+                }
+            }"#,
+        )
+        .expect("model-profile settings should parse");
+
+        let (tiers, exists) =
+            load_pi_roster_config(&settings).expect("model-profile config should load");
+        assert!(exists);
+        assert_eq!(tiers.default, "standard");
+        assert_eq!(
+            tiers.tiers["standard"].model,
+            "openai-codex/gpt-5.6-luna:high"
         );
-        let invalid_thinking = PiTiersFile {
-            default: "fast".to_string(),
-            tiers: bad_thinking,
-            assignments: BTreeMap::new(),
-            ..Default::default()
-        };
-        assert!(validate_pi_tiers(&invalid_thinking, &no_shadow).is_err());
+        assert_eq!(
+            tiers.tiers["standard"].fallback_models,
+            vec!["kimi-coding/k3:medium"]
+        );
+        assert_eq!(tiers.disabled_agents, vec!["worker"]);
+        assert_eq!(tiers.max_recursion_depth, -1);
+    }
+
+    #[test]
+    fn load_pi_roster_config_rejects_removed_profile_thinking_field() {
+        let settings: serde_json::Map<String, JsonValue> = serde_json::from_str(
+            r#"{
+                "pi-roster": {
+                    "defaultModelProfile": "standard",
+                    "modelProfiles": {
+                        "standard": {
+                            "model": "openai-codex/gpt-5.6-luna:high",
+                            "thinking": "high"
+                        }
+                    },
+                    "assignments": {}
+                }
+            }"#,
+        )
+        .expect("legacy settings should remain valid JSON");
+
+        let error =
+            load_pi_roster_config(&settings).expect_err("profile-level thinking must be rejected");
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("thinking"));
     }
 
     #[test]
@@ -3891,9 +3953,8 @@ mod tests {
         tiers.insert(
             "fast".to_string(),
             PiTier {
-                model: "openai-codex/gpt-5.6-luna".to_string(),
-                thinking: "low".to_string(),
-                fallback_models: vec![],
+                model: "openai-codex/gpt-5.6-luna:low".to_string(),
+                fallback_models: vec!["openai-codex/gpt-5.5:medium".to_string()],
                 ..Default::default()
             },
         );
@@ -3938,9 +3999,27 @@ mod tests {
             "unrelated pre-existing settings keys (even ones a different extension owns) must survive Apply"
         );
         assert_eq!(
-            written["pi-roster"]["tiers"]["fast"]["model"],
-            JsonValue::String("openai-codex/gpt-5.6-luna".to_string()),
-            "pi-roster reads its own settings block directly, no expansion into subagents.agentOverrides"
+            written["pi-roster"]["defaultModelProfile"],
+            JsonValue::String("fast".to_string())
+        );
+        assert_eq!(
+            written["pi-roster"]["modelProfiles"]["fast"]["model"],
+            JsonValue::String("openai-codex/gpt-5.6-luna:low".to_string()),
+            "pi-roster persists the complete model spec, not the obsolete tiers schema"
+        );
+        assert_eq!(
+            written["pi-roster"]["modelProfiles"]["fast"]["fallbackModels"][0],
+            JsonValue::String("openai-codex/gpt-5.5:medium".to_string())
+        );
+        assert!(
+            written["pi-roster"]["modelProfiles"]["fast"]
+                .get("thinking")
+                .is_none(),
+            "profile-level thinking must not be written"
+        );
+        assert!(
+            written["pi-roster"].get("tiers").is_none(),
+            "the obsolete tiers key must not be written to settings.json"
         );
         assert_eq!(
             written["pi-roster"]["disabledAgents"][0],

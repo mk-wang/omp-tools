@@ -102,7 +102,6 @@ export type ConfigSnapshot = {
   modelSource: string;
   agentFiles: AgentDefinitionFile[];
   routingSettings: RoutingSettings;
-  shadowedProviders: string[];
   customProviders: CustomProvider[];
   warnings: string[];
 };
@@ -117,7 +116,6 @@ export type SaveRequest = {
   removedModelRoles: string[];
   agentModelOverrides: Record<string, string>;
   agentFiles: AgentFileSave[];
-  shadowedProviders: string[];
   routingSettings: RoutingSettings;
   ompPath: string | null;
 };
@@ -134,15 +132,19 @@ export type PiModelOption = {
   defaultThinkingLevel?: string;
 };
 
+/** Studio's Tier editor shape; each model spec owns its thinking suffix. */
 export type PiTier = {
+  /** Complete provider/model-id:thinking spec for the primary attempt. */
   model: string;
-  thinking: string;
+  /** Complete provider/model-id:thinking specs tried after the primary. */
   fallbackModels: string[];
-  useCase: string;
 };
 
+
 export type PiTiersFile = {
+  /** Maps to pi-roster.defaultModelProfile on disk. */
   default: string;
+  /** Maps to pi-roster.modelProfiles on disk. */
   tiers: Record<string, PiTier>;
   assignments: Record<string, string[]>;
   /** Agent names pi-roster must never dispatch to, regardless of tier assignment. */

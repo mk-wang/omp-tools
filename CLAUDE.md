@@ -1,7 +1,7 @@
 ---
 owner: OMP Model Studio maintainers
 status: active
-updated: 2026-08-20
+updated: 2026-08-21
 tags:
   - pi
   - oh-my-pi
@@ -40,70 +40,69 @@ links:
 | 自定义 Provider / Model catalog | `models.yml`（YAML） | `models.json`（JSON/JSONC） |
 | 自定义 Agent 定义 | `agents/*.md`（frontmatter + 提示词正文） | `agents/*.md`（同形状：`name`/`description`/`model`/...） |
 | 项目级配置 | `<project>/.omp/config.yml`、`<project>/.omp/agents/*.md` | `<project>/.pi/settings.json`、`<project>/.pi/agents/*.md`（项目优先于用户） |
-| 模型路由 | `modelRoles.<role>`：命名选择器别名（如 `@slow`、`@advisor`），供 `@role` 引用；`task.agentModelOverrides.<agent>` 覆盖固定的内置 agent（如 `reviewer`、`security-reviewer`） | `subagents.defaultModel` / `subagents.defaultThinking` 兜底；`subagents.agentOverrides.<agent>` 是扁平 map，一个 agent 一条 `{model, thinking, fallbackModels}` |
-| Provider 禁用 | 顶层 `disabledProviders`（`config.yml`） | 顶层 `disabledProviders`（`settings.json`）；Studio UI 里称为 "shadow" |
-| 扩展机制 | OMP extension roots：原生 `.omp/agents`、OMP 扩展包、Claude marketplace 插件（见 `docs/task-agent-discovery.md`） | `settings.json` 的 `packages` 数组列出 npm 包（如 `pi-subagents`、`pi-computer-use`），实装安装在 `~/.pi/agent/npm/node_modules/`，扩展脚本挂在 `~/.pi/agent/extensions/*.ts` |
+| 模型路由 | `modelRoles.<role>`：命名选择器别名（如 `@slow`、`@advisor`），供 `@role` 引用；`task.agentModelOverrides.<agent>` 覆盖固定的内置 agent（如 `reviewer`、`security-reviewer`） | `settings.json` 的 `"pi-roster"` 块：`defaultModelProfile`、`modelProfiles.<name>:{model,fallbackModels}`、`assignments`；每个 model/fallback 都是自带 thinking 后缀的完整 spec；另有 `disabledAgents` 与 `maxRecursionDepth` |
+| Provider 禁用 | 顶层 `disabledProviders`（`config.yml`）；OMP 用它排除该 provider 提供的模型，`omp models --json` 返回的可用模型已经应用这一过滤。它是 OMP 运行时配置，不是 Model Studio 的 shadow 状态 | 顶层 `disabledProviders`（`settings.json`）；Pi Studio 的 shadow 仍对应 Pi 的真实 provider 禁用 |
+| 扩展机制 | OMP extension roots：原生 `.omp/agents`、OMP 扩展包、Claude marketplace 插件（见 `docs/task-agent-discovery.md`） | `settings.json` 的 `packages` 数组列出 npm 包（如 `pi-roster`、`pi-computer-use`），实装安装在 `~/.pi/agent/npm/node_modules/`，扩展脚本挂在 `~/.pi/agent/extensions/*.ts` |
 
-两边的模型选择器格式一致：`provider/model-id[:thinking]`（如 `openai-codex/gpt-5.6-terra:high`），或角色别名（`@slow`）。
+### 3.1 `disabledProviders` 与 `shadowedProviders` 的边界
+
+在 OMP Model Studio 中，这两个名称必须保持为两个独立概念：
+
+| 名称 | Owner 与持久化 | 运行时语义 | Model Studio 行为 |
+|---|---|---|---|
+| `disabledProviders` | OMP 的 `~/.omp/agent/config.yml`；由 OMP 维护和解释 | 禁止指定 provider 提供的模型参与 OMP 的可用模型与模型解析；因此 `omp models --json` 不会返回这些模型 | Studio 不把它加载成 shadow，不用它补回左侧 Provider List，也不在 Apply 时修改它；外部已有值原样保留 |
+| `shadowedProviders` | Studio React 草稿状态；可随 WebView 本地预设保存，不写入 OMP config | 仅在当前 Studio 编辑会话中把一个**当前可用** provider 视为暂时不可选 | 左侧列表只显示 `omp models --json` 返回的 provider；取消 Use 只更新这个草稿 overlay，并触发 Role/fallback 重分配与校验 |
+
+因此，OMP 左侧 Provider List 的唯一模型来源是 `omp models --json`。不要把 `disabledProviders` 中的 provider 再 union 回列表，也不要把 `shadowedProviders` 序列化成 OMP 的 `disabledProviders`。Apply 只提交模型 Role、路由策略和 Agent 文件；shadow 是编辑辅助状态，不是 OMP provider 禁用配置。
+
+两边的模型选择器格式一致：`provider/model-id[:thinking]`（如 `openai-codex/gpt-5.6-terra:high`）；pi-roster 的 primary `model` 与每个 `fallbackModels` 条目都必须带 thinking 后缀，thinking 不再是 profile 字段。
 
 ## 4. "pi agent"（subagent）从哪来
 
-`pi` 核心本身**不内置** subagent 派遣系统——那是一个独立维护的第三方 pi 扩展包：
-**[`pi-subagents`](https://github.com/nicobailon/pi-subagents)**（本机装在
-`~/.pi/agent/npm/node_modules/pi-subagents`，由 `settings.json` 的 `packages` 列表引入）。
+`pi` 核心本身**不内置** subagent 派遣系统；本仓库当前对接的是独立扩展
+[`pi-roster`](https://github.com/tmustier/pi-roster)，通过 `settings.json` 的 `packages` 数组启用。
 
-- 它自带的内置 agent（`agents/*.md`）：`delegate`、`oracle`、`researcher`、`reviewer`、`scout`、`worker`。
-- 本项目 Rust 后端的 `PI_BUILTIN_AGENTS`（`src-tauri/src/lib.rs`）在此基础上额外列了 `gpt-pro`。
-- 自定义的（本机可见：`code-mapper`、`product-designer`、`agent-tooling-engineer` 等）从
-  `~/.pi/agent/agents/*.md` 的 frontmatter 发现，`name:` 字段即 agent 名。
+- pi-roster 不提供固定的内置 agent；它从 `~/.pi/agent/agents/*.md` 发现用户自定义 agent。
+- 项目级 agent 需要显式启用并经过信任检查，不会自动并入用户级花名册。
+- 本项目 Rust 后端的 `discover_pi_agent_names` 与上述发现边界保持一致，不再维护一份固定 builtin 列表。
 
-**"pi agent"** 在本仓库语境下 = 这份花名册里的一个具名条目（内置或自定义），每个都可以通过
-`subagents.agentOverrides.<name>` 独立路由到某个模型选择器。这与 `oh-my-pi` 侧的
-"Agent 定义"（见 `ROLE-GUIDE.md` §3）是同一层概念，但派遣/发现机制和内置清单完全不同，不要互相套用。
+本仓库语境下，“pi agent”就是这份 `.md` 花名册中的一个具名条目。它的默认模型由
+`pi-roster.assignments` 决定；未分配的 agent 使用 `defaultModelProfile`。
 
-## 5. "Tier" 是什么
+## 5. pi-roster 的 model profile
 
-`pi-subagents` 自己的文档（`docs/models.md`，"Recommended model tiering" 一节）里，Tier 只是一种
-**非强制的分组建议**，按任务形状分四档：
-
-1. **Fast workhorse** —— 最便宜的可用模型 + 低思考量，用于侦察/查找/机械式编辑（例：`scout`）。
-2. **Standard well-scoped** —— 中档模型 + 中等思考量，用于大多数边界清晰的委派任务（例：`worker`、`reviewer`）。
-3. **Deep but bounded** —— 顶级推理模型 + 高思考量，只用于目标和完成标准都写清楚的难任务（例：oracle 类 agent）；目标模糊时这类模型容易空转，不要用在开放式任务上。
-4. **Taste and intent** —— 擅长读懂人类意图、能做判断而不空转的模型，用于 UX/产品取舍、模糊需求下的规划等开放式工作。
-
-上游文档里这只是指导性建议，pi-subagents 实际读取的仍然是扁平的
-`subagents.agentOverrides.<agent>` map，并没有 "Tier" 这个配置原语。
-
-`~/.pi/agent/tiers.json` 把这份建议**变成了真正可编辑的一等数据结构**：
+pi-roster 只读写 `~/.pi/agent/settings.json` 顶层的 `"pi-roster"` 配置块，不读取
+`tiers.json`、`apply-tiers.mjs` 或 `subagents.agentOverrides`。当前 Studio UI 为保持既有编辑体验，
+仍把 profile 卡片称为 Tier；Rust 在 settings 边界将其转换为下面的正式 schema：
 
 ```json
 {
-  "default": "<tier 名>",
-  "tiers": { "<tier 名>": { "model": "...", "thinking": "...", "fallbackModels": [...] } },
-  "assignments": { "<tier 名>": ["agent 名", ...] }
+  "pi-roster": {
+    "defaultModelProfile": "standard",
+    "modelProfiles": {
+      "standard": {
+        "model": "kimi-coding/k3-256k:medium",
+        "fallbackModels": ["opencode-go/glm-5.3:high"]
+      }
+    },
+    "assignments": {"standard": ["reviewer"]},
+    "disabledAgents": [],
+    "maxRecursionDepth": 2
+  }
 }
 ```
 
-`pi` 和 `pi-subagents` 都不会直接读这个文件——它是一份"单一事实来源"，需要被**展开**成
-`settings.json` 里 `subagents.agentOverrides` 那个扁平 map，这样改一个 tier 就能同时改完所有分配到
-它名下的 agent，而不必逐个 agent 改。做这件"展开"的实现有两处，语义必须保持一致：
-
-- `~/.pi/agent/apply-tiers.mjs`——早于本项目就存在的独立脚本，支持 `apply`/`show`/`panic`/`set` 子命令。
-- `src-tauri/src/lib.rs` 的 `save_pi_tiers`/`expand_pi_agent_overrides`——本项目对同一逻辑的原生 Rust
-  重新实现，由 `src/PiPanel.tsx` 驱动。它对 "shadow 一个 provider" 的处理（`PiPanel.tsx` 里
-  `reassignTiersAwayFromShadowedProviders` 上方的注释）是照着 `apply-tiers.mjs panic` 的行为特意对齐的：
-  立刻换用 fallback 列表里下一个候选，而不是把受影响的 tier 都标红等人工修。
-
-`PiTier.useCase`（UI 里的"使用场景"输入框）是 Studio 独有的元数据，只存在于 `tiers.json`，从不展开进
-`agentOverrides`——`pi-subagents` 不认识这个字段。
+`modelProfiles` 与 `assignments` 是开放 map；profile 名、agent 名和数量由使用方决定。每个
+primary/fallback model spec 必须是 `provider/model-id:thinking`，profile-level `thinking` 与其它未知
+profile 字段都不被 pi-roster 接受。Provider shadow 仍写入 settings 顶层真实的 `disabledProviders`，对 Pi 全局模型选择生效。
 
 ## 6. 需要深挖时去哪查
 
 - `oh-my-pi` 侧模型角色/Agent 发现/解析的完整语义：先看仓库内 [`ROLE-GUIDE.md`](ROLE-GUIDE.md)（已系统梳理，仅覆盖
   `omp`），核对源码时用 `oh-my-pi/docs/task-agent-discovery.md`、`docs/models.md`、`docs/settings.md`。
-- `pi`/`pi-subagents` 侧模型路由、Tier、fallback、missions 等：
-  `~/.pi/agent/npm/node_modules/pi-subagents/docs/`（`models.md`、`agents.md`、`configuration.md`、
-  `workflows.md`）——这是本机实际安装的插件版本，比 `/opt/workspace/opensource/pi` 仓库本身更贴近真实
-  运行行为（`pi-subagents` 是独立发布的第三方包，不随 `pi` 核心仓库一起改动）。
+- pi-roster 侧以 `/Volumes/CaseSenHD/WorkSpace/mk/pi-roster/docs/DESIGN.md` 及其
+  `src/model-profiles.ts`、`src/roster-config-store.ts` 为当前本机版本的配置 schema 与持久化实现依据。
+- `pi` 核心的 settings、models 与扩展加载行为仍以本机安装版本和 `/opt/workspace/opensource/pi` 为参考；
+  不要把 pi-subagents 的旧 `subagents.*` schema 套到 pi-roster 上。
 - 两个源码仓库都可能领先或落后于本机安装的可执行文件版本；精确核对时优先信任已安装 CLI 的自省输出
   （`omp config list --json`、`omp models --json`、`pi --list-models`），源码只用来解释"为什么是这样"。

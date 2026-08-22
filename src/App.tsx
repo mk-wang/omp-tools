@@ -352,52 +352,117 @@ function cloneRoutingSettings(settings: RoutingSettings): RoutingSettings {
 }
 
 /**
- * Shadowing a provider should feel like OMP's own runtime fallback: move on
- * to the next candidate immediately, not leave every affected Role flagged
- * red for manual repair. For each system/custom Role currently pointed at a
- * newly-shadowed provider, promote the first surviving (non-shadowed)
- * candidate from that Role's own fallback chain to primary. Roles with no
- * fallback chain, or whose whole chain is also shadowed, are left invalid —
- * there is no safe candidate to guess, so those still need a manual pick.
- * Any chain selector on a shadowed provider is stripped everywhere else too,
- * since OMP itself would reject a saved config that still references one.
+ * Shadowing a provider is a Model Studio draft overlay: move on to the next
+ * candidate immediately, not leave every affected Role flagged red for manual
+ * repair. It is deliberately separate from OMP's `disabledProviders`, which
+ * controls the models returned by `omp models --json` and is never changed here.
+ * For each system/custom Role currently pointed at a newly-shadowed provider,
+ * promote the first surviving (non-shadowed) candidate from that Role's own
+ * fallback chain to primary. Roles with no fallback chain, or whose whole
+ * chain is also shadowed, are left invalid — there is no safe candidate to
+ * guess, so those still need a manual pick.
+ * Any chain selector on a shadowed provider is stripped from the draft too,
+ * so the resulting config no longer routes through a provider the user hid.
  */
+
 function reassignAwayFromShadowedProviders(
   shadowed: string[],
   values: SlotValues,
   customRoles: CustomRole[],
-  routingSettings: RoutingSettings
+  routingSettings: RoutingSettings,
+  models: ModelOption[]
 ): { values: SlotValues; customRoles: CustomRole[]; routingSettings: RoutingSettings; changed: boolean } {
   const shadowedSet = new Set(shadowed);
   const isShadowedSelector = (selector: string) => {
     const provider = providerForSelector(selector);
     return Boolean(provider) && shadowedSet.has(provider);
   };
+  const chains = routingSettings.retryFallbackChains.map(chain => ({
+    target: chain.target,
+    selectors: [...chain.selectors]
+  }));
 
-  let chainsChanged = false;
-  const chains = routingSettings.retryFallbackChains
-    .filter(chain => {
-      const targetShadowed = isShadowedSelector(chain.target);
-      if (targetShadowed) chainsChanged = true;
-      return !targetShadowed;
-    })
-    .map(chain => {
-      const selectors = chain.selectors.filter(selector => !isShadowedSelector(selector));
-      if (selectors.length !== chain.selectors.length) chainsChanged = true;
-      return { target: chain.target, selectors };
+  const applicableChainIndex = (role: string, currentValue: string): number | undefined => {
+    const current = splitSelector(currentValue);
+    const currentProvider = providerForSelector(currentValue);
+    if (!current.base || current.alias || !currentProvider || current.base.endsWith("/*")) return undefined;
+
+    const exactIndex = chains.findIndex(chain => {
+      const target = splitSelector(chain.target.trim());
+      return target.base === current.base && target.base.includes("/") && !target.base.endsWith("/*");
     });
+    if (exactIndex >= 0) return exactIndex;
 
-  const chainByTarget = new Map(chains.map((chain, index) => [chain.target.trim(), index] as const));
-  const promotedFromChain = new Map<string, string>();
+    const currentModelId = current.base.slice(`${currentProvider}/`.length);
+    let wildcardIndex = -1;
+    let wildcardPrefixLength = -1;
+    chains.forEach((chain, index) => {
+      const target = splitSelector(chain.target.trim()).base;
+      if (!target.endsWith("/*")) return;
+      const template = target.slice(0, -2);
+      const slash = template.indexOf("/");
+      const provider = slash < 0 ? template : template.slice(0, slash);
+      const idPrefix = slash < 0 ? "" : template.slice(slash + 1);
+      if (provider !== currentProvider || (idPrefix && !currentModelId.startsWith(`${idPrefix}/`))) return;
+      if (idPrefix.length > wildcardPrefixLength) {
+        wildcardIndex = index;
+        wildcardPrefixLength = idPrefix.length;
+      }
+    });
+    if (wildcardIndex >= 0) return wildcardIndex;
+
+    const roleIndex = chains.findIndex(chain => chain.target.trim() === role);
+    if (roleIndex >= 0) return roleIndex;
+    const defaultIndex = chains.findIndex(chain => chain.target.trim() === "default");
+    return defaultIndex >= 0 ? defaultIndex : undefined;
+  };
+
+  const materializeCandidate = (selector: string, currentValue: string): string | null => {
+    const parsed = splitSelector(selector);
+    if (!parsed.base.endsWith("/*")) return parsed.base ? selector : null;
+    const current = splitSelector(currentValue);
+    const currentProvider = providerForSelector(currentValue);
+    if (!currentProvider || !current.base.startsWith(`${currentProvider}/`)) return null;
+    const currentModelId = current.base.slice(`${currentProvider}/`.length);
+    const template = parsed.base.slice(0, -2);
+    const slash = template.indexOf("/");
+    const targetProvider = slash < 0 ? template : template.slice(0, slash);
+    const idPrefix = slash < 0 ? "" : template.slice(slash + 1);
+    const bareModelId = currentModelId.split("/").pop() ?? "";
+    const candidateModelIds = idPrefix
+      ? [`${idPrefix}/${bareModelId}`]
+      : [currentModelId, ...(currentModelId === bareModelId ? [] : [bareModelId])];
+    const model = candidateModelIds
+      .map(modelId => `${targetProvider}/${modelId}`)
+      .map(selectorBase => models.find(model => model.selector === selectorBase && !shadowedSet.has(model.provider)))
+      .find((model): model is ModelOption => Boolean(model));
+    return model ? withEffort(model.selector, parsed.effort) : null;
+  };
+
+  const consumedFallbacks = new Map<string, Set<string>>();
+  const consume = (chain: FallbackChain, selector: string) => {
+    const consumed = consumedFallbacks.get(chain.target.trim()) ?? new Set<string>();
+    consumed.add(selector);
+    consumedFallbacks.set(chain.target.trim(), consumed);
+  };
 
   const promote = (role: string, currentValue: string): string | null => {
     if (!isShadowedSelector(currentValue)) return null;
-    const chainIndex = chainByTarget.get(role);
+    const chainIndex = applicableChainIndex(role, currentValue);
     if (chainIndex === undefined) return null;
-    const candidate = chains[chainIndex].selectors[0];
-    if (!candidate) return null;
-    promotedFromChain.set(role, candidate);
-    return candidate;
+    const chain = chains[chainIndex];
+    for (const selector of chain.selectors) {
+      if (isShadowedSelector(selector)) continue;
+      const candidate = materializeCandidate(selector, currentValue);
+      if (!candidate || isShadowedSelector(candidate)) continue;
+      const parsed = splitSelector(candidate);
+      if (!parsed.alias && parsed.base.includes("/") && !parsed.base.endsWith("/*") && isUnavailableModelSelector(candidate, models)) {
+        continue;
+      }
+      consume(chain, selector);
+      return candidate;
+    }
+    return null;
   };
 
   let valuesChanged = false;
@@ -418,14 +483,24 @@ function reassignAwayFromShadowedProviders(
     return { ...customRole, value: promoted };
   });
 
-  if (promotedFromChain.size > 0) chainsChanged = true;
   const finalChains = chains
+    .filter(chain => !isShadowedSelector(chain.target))
     .map(chain => {
-      const promoted = promotedFromChain.get(chain.target.trim());
-      if (!promoted) return chain;
-      return { ...chain, selectors: chain.selectors.filter(selector => selector !== promoted) };
+      const consumed = consumedFallbacks.get(chain.target.trim());
+      return {
+        target: chain.target,
+        selectors: chain.selectors.filter(selector => !isShadowedSelector(selector) && !consumed?.has(selector))
+      };
     })
     .filter(chain => chain.selectors.length > 0);
+  const chainsChanged = finalChains.length !== chains.length
+    || finalChains.some((chain, index) => {
+      const original = chains[index];
+      return !original
+        || original.target !== chain.target
+        || original.selectors.length !== chain.selectors.length
+        || original.selectors.some((selector, selectorIndex) => selector !== chain.selectors[selectorIndex]);
+    });
 
   return {
     values: nextValues,
@@ -480,10 +555,9 @@ function parsePreset(value: unknown): Preset | null {
   if (!Object.hasOwn(customRoleValues, "tester") && storedValues.tester) {
     customRoleValues.tester = storedValues.tester;
   }
-  // Migrate presets written by the older UI; this is WebView-local state, never OMP config.
-  const hasShadowedProviders = Object.hasOwn(record, "shadowedProviders") || Object.hasOwn(record, "disabledProviders");
-  const shadowedProviders = hasShadowedProviders
-    ? stringList(Object.hasOwn(record, "shadowedProviders") ? record.shadowedProviders : record.disabledProviders)
+  // Shadow state is WebView-local; never import OMP's disabledProviders into it.
+  const shadowedProviders = Object.hasOwn(record, "shadowedProviders")
+    ? stringList(record.shadowedProviders)
     : undefined;
   return {
     id: record.id,
@@ -1528,7 +1602,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     }
   }, [theme]);
 
-  const applySnapshot = (next: ConfigSnapshot) => {
+  const applySnapshot = (next: ConfigSnapshot, localShadowedProviders: string[] = []) => {
     const rawReviewer = next.agentModelOverrides.reviewer ?? "";
     const rawSecurityReviewer = next.agentModelOverrides["security-reviewer"] ?? "";
     const followsSlow = rawReviewer === "" || rawReviewer === "@slow";
@@ -1575,7 +1649,11 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setCustomProviderSaveError("");
     setPendingDeleteCustomProvider("");
     setRoutingSettings(cloneRoutingSettings(next.routingSettings));
-    setShadowedProviders([...next.shadowedProviders].sort((left, right) => left.localeCompare(right)));
+    const visibleProviders = new Set(next.models.map(model => model.provider));
+    setShadowedProviders(
+      [...new Set(localShadowedProviders.filter(provider => visibleProviders.has(provider)))]
+        .sort((left, right) => left.localeCompare(right))
+    );
     setSnapshot(next);
     setSaved(false);
   };
@@ -1615,15 +1693,11 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     void refresh();
   }, []);
   const providerNames = useMemo(() => {
-    // `omp models --json` excludes providers already in `disabledProviders` (the
-    // core registry's `getAvailable()` filters them out), so a shadowed provider
-    // would otherwise vanish from this list after Apply and could never be
-    // un-shadowed again. Union with the current shadow set to keep it listed.
+    // OMP has already applied config.yml's `disabledProviders` before
+    // returning this model list; local shadow state must not add providers back.
     const names = new Set(snapshot?.models.map(model => model.provider) ?? []);
-    shadowedProviders.forEach(provider => names.add(provider));
-    customProviders.forEach(provider => names.add(provider.id));
     return [...names].sort((left, right) => left.localeCompare(right));
-  }, [customProviders, snapshot, shadowedProviders]);
+  }, [snapshot]);
 
   const selectedModelSlots = useMemo(() => {
     const fixedAssignments = SLOT_DEFINITIONS.map(definition => {
@@ -2131,7 +2205,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     if (shadowedProviders.includes(provider)) return;
     const nextShadowed = [...shadowedProviders, provider].sort((left, right) => left.localeCompare(right));
     setShadowedProviders(nextShadowed);
-    const reassigned = reassignAwayFromShadowedProviders(nextShadowed, values, customRoles, routingSettings);
+    const reassigned = reassignAwayFromShadowedProviders(nextShadowed, values, customRoles, routingSettings, availableModels);
     if (reassigned.changed) {
       setValues(reassigned.values);
       setCustomRoles(reassigned.customRoles);
@@ -2153,7 +2227,13 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setReviewerFollowsSlow(preset.reviewerFollowsSlow);
     setSecurityReviewerFollowsSlow(preset.securityReviewerFollowsSlow);
     if (preset.routingSettings) setRoutingSettings(cloneRoutingSettings(preset.routingSettings));
-    if (preset.shadowedProviders) setShadowedProviders([...preset.shadowedProviders]);
+    const visibleProviders = new Set((snapshot?.models ?? []).map(model => model.provider));
+    setShadowedProviders(
+      preset.shadowedProviders
+        ? [...new Set(preset.shadowedProviders.filter(provider => visibleProviders.has(provider)))]
+            .sort((left, right) => left.localeCompare(right))
+        : []
+    );
     const existingRoles = new Set(customRoles.map(customRole => customRole.role));
     const skippedRoles = Object.keys(preset.customRoleValues).filter(role => !existingRoles.has(role));
     setCustomRoles(current =>
@@ -2256,7 +2336,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     agentFiles: customAgents
       .filter(agent => agent.dirty)
       .map(agent => ({ fileName: agent.fileName, agentMarkdown: agent.agentMarkdown })),
-    shadowedProviders,
     routingSettings: cloneRoutingSettings(routingSettings),
     ompPath: customOmpPath.trim() || null
   };
@@ -2284,7 +2363,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setSaved(false);
     try {
       const next = await saveSnapshot(request);
-      applySnapshot(next);
+      applySnapshot(next, shadowedProviders);
       setSaved(true);
     } catch (saveError) {
       setError(readableError(saveError));
@@ -2514,10 +2593,10 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
 
           <section className="provider-card">
             <div className="catalog-heading"><span>PROVIDER LIST</span><strong>{providerNames.length}</strong></div>
-            <p className="provider-help">列表来自 OMP 当前可用模型；取消 Use 会立即把受影响 Role 切换到各自 fallback chain 中下一个可用候选，Apply 时写入 OMP 真实的 disabledProviders。没有可用候选的 Role 会保持标红，需要手动选择。</p>
+            <p className="provider-help">列表来自 OMP 当前可用模型（`omp models --json` 已按 disabledProviders 过滤）；取消 Use 只在当前草稿中 shadow 该 provider，并立即把受影响 Role 切换到各自 fallback chain 中下一个可用候选。Apply 只写入 Role、路由策略和 Agent，不会修改 OMP 的 disabledProviders。没有可用候选的 Role 会保持标红，需要手动选择。</p>
             <div className="provider-key">
               <span><i className="key-mark used-mark" /> Used by roles</span>
-              <span><i className="key-mark shadowed-mark" /> Shadowed · will disable in OMP</span>
+              <span><i className="key-mark shadowed-mark" /> Shadowed · draft only</span>
             </div>
             <div className="provider-list">
               {providerNames.map(provider => {

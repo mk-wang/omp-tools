@@ -109,7 +109,7 @@ bun run tauri build
 - **CSS Architecture**: Single vanilla stylesheet `src/styles.css` utilizing CSS variables, `color-mix`, and semantic tokens (`--bg`, `--panel`, `--border`, `--accent`).
 
 ### 3. Rust Backend Conventions
-- **Non-Destructive Config Mutation**: `save_snapshot()` parses the config through `load_yaml()` and updates only managed sections (`modelRoles`, `task.agentModelOverrides`, `disabledProviders`) with the nested setter helpers while preserving unmanaged keys; YAML serialization may rewrite formatting and comments.
+- **Non-Destructive Config Mutation**: `save_snapshot()` parses the config through `load_yaml()` and updates only the managed model, routing, and Agent sections with the nested setter helpers while preserving `disabledProviders` and other unmanaged keys; YAML serialization may rewrite formatting and comments.
 - **Atomic File Writing**: Files must be written to sibling hidden temporary files and renamed (`fs::rename`) to prevent partial writes during crashes or interruptions.
 - **Path Sanitization**: Backend helper `display_path()` replaces user home paths with `~/` before returning data across the IPC boundary to avoid leaking local usernames.
 
