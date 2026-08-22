@@ -35,13 +35,36 @@ const TIER_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const EMPTY_TIERS: PiTiersFile = { default: "", tiers: {}, assignments: {}, disabledAgents: [], maxRecursionDepth: 2 };
 
-function readableError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function splitKnownThinkingSuffix(value: string): { baseModel: string; thinking: string } {
+  const colonIndex = value.lastIndexOf(":");
+  if (colonIndex === -1) return { baseModel: value, thinking: "" };
+  const suffix = value.slice(colonIndex + 1);
+  return THINKING_LEVELS.includes(suffix)
+    ? { baseModel: value.slice(0, colonIndex), thinking: suffix }
+    : { baseModel: value, thinking: "" };
 }
 
-function readTheme(): Theme {
-  if (typeof window === "undefined") return "light";
-  return window.localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
+function baseModelOf(value: string): string {
+  return splitKnownThinkingSuffix(value).baseModel;
+}
+
+function thinkingLevelOf(value: string): string {
+  return splitKnownThinkingSuffix(value).thinking;
+}
+
+function modelSpecFor(value: string, thinking: string): string {
+  const baseModel = baseModelOf(value).trim();
+  return baseModel && thinking ? `${baseModel}:${thinking}` : baseModel;
+}
+
+function isValidModelSpec(value: string): boolean {
+  const baseModel = baseModelOf(value).trim();
+  return Boolean(
+    thinkingLevelOf(value)
+      && baseModel.includes("/")
+      && !baseModel.startsWith("/")
+      && !baseModel.endsWith("/")
+  );
 }
 
 function cloneTiers(data: PiTiersFile): PiTiersFile {
@@ -49,7 +72,7 @@ function cloneTiers(data: PiTiersFile): PiTiersFile {
     default: data.default,
     tiers: Object.fromEntries(Object.entries(data.tiers).map(([key, tier]) => [
       key,
-      { model: tier.model, thinking: tier.thinking, fallbackModels: [...tier.fallbackModels], useCase: tier.useCase }
+      { model: tier.model, fallbackModels: [...tier.fallbackModels] }
     ])),
     assignments: Object.fromEntries(Object.entries(data.assignments).map(([key, agents]) => [key, [...agents]])),
     disabledAgents: [...data.disabledAgents],
@@ -57,26 +80,177 @@ function cloneTiers(data: PiTiersFile): PiTiersFile {
   };
 }
 
-function tierCardElementId(tierName: string): string {
-  return `pi-tier-card-${tierName}`;
-}
-
 function providerOf(selector: string): string {
-  return selector.includes("/") ? selector.split("/")[0] : "";
+  const baseModel = baseModelOf(selector);
+  return baseModel.includes("/") ? baseModel.split("/")[0] : "";
 }
 
 function thinkingOptionsForModel(selector: string, models: PiModelOption[]): string[] {
-  const model = models.find(candidate => candidate.selector === selector);
+  const model = models.find(candidate => candidate.selector === baseModelOf(selector));
   if (!model || !model.reasoning) return ["off"];
   const levels = model.thinking?.length ? model.thinking : THINKING_LEVELS;
   return [...new Set(["off", ...levels])];
 }
 
+function preferredThinkingForModel(
+  selector: string,
+  models: PiModelOption[],
+  inheritedThinking = ""
+): string {
+  const options = thinkingOptionsForModel(selector, models);
+  const current = thinkingLevelOf(selector) || inheritedThinking;
+  if (current && options.includes(current)) return current;
+  const model = models.find(candidate => candidate.selector === baseModelOf(selector));
+  const defaultThinking = model?.defaultThinkingLevel;
+  return defaultThinking && options.includes(defaultThinking)
+    ? defaultThinking
+    : options.includes("medium")
+      ? "medium"
+      : options[0] ?? "off";
+}
+
 function modelIdForProviderSelector(value: string, provider: string): string {
-  const base = value.trim().split(":")[0];
+  const base = baseModelOf(value).trim();
   const prefix = `${provider}/`;
   return base.startsWith(prefix) ? base.slice(prefix.length) : "";
 }
+
+function PiModelSelect({
+  value,
+  models,
+  shadowedProviders,
+  onChange,
+  disabled = false
+}: {
+  value: string;
+  models: PiModelOption[];
+  shadowedProviders: string[];
+  onChange: (value: string) => void;
+  disabled?: boolean;
+}) {
+  const shadowedSet = new Set(shadowedProviders);
+  const baseValue = baseModelOf(value);
+  const currentProvider = providerOf(baseValue);
+  const providers = useMemo(() => {
+    const names = new Set(models.filter(model => !shadowedSet.has(model.provider)).map(model => model.provider));
+    if (currentProvider) names.add(currentProvider);
+    return [...names].sort((left, right) => left.localeCompare(right));
+  }, [models, shadowedProviders, currentProvider]);
+  const selectedProvider = currentProvider || providers[0] || "";
+  const providerModels = models.filter(model => model.provider === selectedProvider);
+  const selectedModel = providerModels.find(model => model.selector === baseValue);
+
+  return (
+    <div className="picker-grid pi-model-select">
+      <label className="field-group">
+        <span>Provider</span>
+        <select
+          value={selectedProvider}
+          disabled={disabled || providers.length === 0}
+          onChange={event => {
+            const nextProvider = event.target.value;
+            const firstModel = models.find(model => model.provider === nextProvider);
+            const nextSelector = firstModel?.selector ?? `${nextProvider}/`;
+            onChange(modelSpecFor(
+              nextSelector,
+              preferredThinkingForModel(nextSelector, models, thinkingLevelOf(value))
+            ));
+          }}
+        >
+          {providers.length === 0 && <option value="">No providers</option>}
+          {providers.map(provider => (
+            <option value={provider} key={provider}>
+              {provider}{shadowedSet.has(provider) ? " · shadowed" : ""}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="field-group model-field">
+        <span>Model</span>
+        <select
+          value={baseValue}
+          disabled={disabled || providerModels.length === 0}
+          onChange={event => {
+            const nextBase = event.target.value;
+            onChange(modelSpecFor(
+              nextBase,
+              preferredThinkingForModel(nextBase, models, thinkingLevelOf(value))
+            ));
+          }}
+        >
+          {!baseValue && providerModels.length === 0 && <option value="">No models</option>}
+          {!baseValue && providerModels.length > 0 && <option value="">Select model…</option>}
+          {baseValue && !providerModels.some(model => model.selector === baseValue) && (
+            <option value={baseValue}>{baseValue.split("/").slice(1).join("/") || baseValue} · unavailable</option>
+          )}
+          {providerModels.map(model => (
+            <option value={model.selector} key={model.selector}>{model.id}</option>
+          ))}
+        </select>
+      </label>
+      {selectedModel && (
+        <div className="model-metadata">
+          {selectedModel.contextWindow !== null && <span>Context {Math.round(selectedModel.contextWindow / 1000)}K</span>}
+          {selectedModel.maxTokens !== null && <span>Output {Math.round(selectedModel.maxTokens / 1000)}K</span>}
+          {selectedModel.images && <span>Images</span>}
+          {selectedModel.thinking?.length && <span>Thinking {selectedModel.thinking.join("/")}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
+function PiThinkingSelect({
+  value,
+  models,
+  onChange,
+  disabled = false
+}: {
+  value: string;
+  models: PiModelOption[];
+  onChange: (value: string) => void;
+  disabled?: boolean;
+}) {
+  const baseModel = baseModelOf(value);
+  const options = thinkingOptionsForModel(baseModel, models);
+  const current = thinkingLevelOf(value);
+  return (
+    <label className="field-group thinking-field">
+      <span>Thinking</span>
+      <select
+        value={current}
+        disabled={disabled || !baseModel}
+        onChange={event => onChange(modelSpecFor(value, event.target.value))}
+      >
+        {!current && <option value="">Select thinking…</option>}
+        {current && !options.includes(current) && <option value={current}>{current}</option>}
+        {options.map(level => <option value={level} key={level}>{level}</option>)}
+      </select>
+    </label>
+  );
+}
+
+
+function readableError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function readTheme(): Theme {
+  if (typeof window === "undefined") return "light";
+  try {
+    return window.localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
+}
+
+
+function tierCardElementId(tierName: string): string {
+  return `pi-tier-card-${tierName}`;
+}
+
 
 /**
  * Shadowing a provider moves each affected tier on to the next candidate
@@ -128,78 +302,6 @@ function uniqueTierName(existing: Record<string, unknown>): string {
   return candidate;
 }
 
-function PiModelSelect({
-  value,
-  models,
-  shadowedProviders,
-  onChange,
-  disabled = false
-}: {
-  value: string;
-  models: PiModelOption[];
-  shadowedProviders: string[];
-  onChange: (value: string) => void;
-  disabled?: boolean;
-}) {
-  const shadowedSet = new Set(shadowedProviders);
-  const currentProvider = providerOf(value);
-  const providers = useMemo(() => {
-    const names = new Set(models.filter(model => !shadowedSet.has(model.provider)).map(model => model.provider));
-    if (currentProvider) names.add(currentProvider);
-    return [...names].sort((left, right) => left.localeCompare(right));
-  }, [models, shadowedProviders, currentProvider]);
-  const selectedProvider = currentProvider || providers[0] || "";
-  const providerModels = models.filter(model => model.provider === selectedProvider);
-  const selectedModel = providerModels.find(model => model.selector === value) ?? providerModels[0];
-
-  return (
-    <div className="picker-grid pi-model-select">
-      <label className="field-group">
-        <span>Provider</span>
-        <select
-          value={selectedProvider}
-          disabled={disabled || providers.length === 0}
-          onChange={event => {
-            const nextProvider = event.target.value;
-            const firstModel = models.find(model => model.provider === nextProvider);
-            onChange(firstModel?.selector ?? `${nextProvider}/`);
-          }}
-        >
-          {providers.length === 0 && <option value="">No providers</option>}
-          {providers.map(provider => (
-            <option value={provider} key={provider}>
-              {provider}{shadowedSet.has(provider) ? " · shadowed" : ""}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="field-group model-field">
-        <span>Model</span>
-        <select
-          value={value}
-          disabled={disabled || providerModels.length === 0}
-          onChange={event => onChange(event.target.value)}
-        >
-          {providerModels.length === 0 && <option value="">No models</option>}
-          {value && !providerModels.some(model => model.selector === value) && (
-            <option value={value}>{value.split("/").slice(1).join("/")}</option>
-          )}
-          {providerModels.map(model => (
-            <option value={model.selector} key={model.selector}>{model.id}</option>
-          ))}
-        </select>
-      </label>
-      {selectedModel && (
-        <div className="model-metadata">
-          {selectedModel.contextWindow !== null && <span>Context {Math.round(selectedModel.contextWindow / 1000)}K</span>}
-          {selectedModel.maxTokens !== null && <span>Output {Math.round(selectedModel.maxTokens / 1000)}K</span>}
-          {selectedModel.images && <span>Images</span>}
-          {selectedModel.thinking?.length && <span>Thinking {selectedModel.thinking.join("/")}</span>}
-        </div>
-      )}
-    </div>
-  );
-}
 
 export default function PiPanel({
   onSwitchTool
@@ -219,7 +321,11 @@ export default function PiPanel({
   const [theme, setTheme] = useState<Theme>(readTheme);
   const [customPiPath, setCustomPiPath] = useState(() => {
     if (typeof window === "undefined") return "";
-    return window.localStorage.getItem(PI_PATH_STORAGE_KEY) ?? "";
+    try {
+      return window.localStorage.getItem(PI_PATH_STORAGE_KEY) ?? "";
+    } catch {
+      return "";
+    }
   });
   const [customPiPathDraft, setCustomPiPathDraft] = useState(customPiPath);
   const [loading, setLoading] = useState(true);
@@ -276,6 +382,10 @@ export default function PiPanel({
   }, []);
 
   const models = snapshot?.models ?? [];
+  const selectableModels = useMemo(
+    () => models.filter(model => !shadowedProviders.includes(model.provider)),
+    [models, shadowedProviders]
+  );
   const providers = useMemo(() => {
     // `pi --list-models` excludes providers already in `disabledProviders`, so a
     // shadowed provider would otherwise vanish from this list after Apply and
@@ -312,8 +422,7 @@ export default function PiPanel({
         isDisabled,
         // disabledAgents wins over any tier assignment (pi-roster DESIGN.md §5.1).
         model: isDisabled ? "" : tier?.model ?? "",
-        thinking: isDisabled ? "" : tier?.thinking ?? "",
-        useCase: tier?.useCase ?? ""
+        thinking: isDisabled ? "" : thinkingLevelOf(tier?.model ?? "")
       };
     });
   }, [agentNames, roleOwner, tiers]);
@@ -347,8 +456,17 @@ export default function PiPanel({
     return conflicts;
   }, [tiers, shadowedProviders]);
 
-  const emptyModelTiers = tierNames.filter(name => !tiers.tiers[name].model.trim());
-  const canApply = shadowConflicts.length === 0 && emptyModelTiers.length === 0 && !saving;
+  const invalidModelSpecs = tierNames.flatMap(name => {
+    const tier = tiers.tiers[name];
+    const errors = isValidModelSpec(tier.model)
+      ? []
+      : [`Tier "${name}" 的主模型必须是 provider/model-id:thinking 格式`];
+    tier.fallbackModels.forEach((selector, index) => {
+      if (!isValidModelSpec(selector)) errors.push(`Tier "${name}" 的 fallback ${index + 1} 必须是 provider/model-id:thinking 格式`);
+    });
+    return errors;
+  });
+  const canApply = tierNames.length > 0 && shadowConflicts.length === 0 && invalidModelSpecs.length === 0 && !saving;
 
   const updateTiers = (next: PiTiersFile) => {
     setSaved(false);
@@ -358,19 +476,15 @@ export default function PiPanel({
   const addTier = () => {
     const name = uniqueTierName(tiers.tiers);
     const next = cloneTiers(tiers);
-    const model = models[0]?.selector ?? "";
-    const thinkingOptions = thinkingOptionsForModel(model, models);
+    const model = selectableModels[0]?.selector ?? "";
     next.tiers[name] = {
-      model,
-      thinking: thinkingOptions.includes("medium") ? "medium" : thinkingOptions[0] ?? "off",
-      fallbackModels: [],
-      useCase: ""
+      model: modelSpecFor(model, preferredThinkingForModel(model, models)),
+      fallbackModels: []
     };
     next.assignments[name] = [];
     if (!next.default) next.default = name;
     updateTiers(next);
   };
-
   const removeTier = (name: string) => {
     if (pendingDeleteTier !== name) {
       setPendingDeleteTier(name);
@@ -397,18 +511,9 @@ export default function PiPanel({
     updateTiers(next);
   };
 
-  const updateTierField = (name: string, field: "model" | "thinking" | "useCase", value: string) => {
-    const next = cloneTiers(tiers);
-    next.tiers[name][field] = value;
-    updateTiers(next);
-  };
   const updateTierModel = (name: string, value: string) => {
     const next = cloneTiers(tiers);
     next.tiers[name].model = value;
-    const options = thinkingOptionsForModel(value, models);
-    if (!options.includes(next.tiers[name].thinking)) {
-      next.tiers[name].thinking = options.includes("medium") ? "medium" : options[0] ?? "off";
-    }
     updateTiers(next);
   };
 
@@ -420,7 +525,8 @@ export default function PiPanel({
 
   const addFallback = (name: string) => {
     const next = cloneTiers(tiers);
-    next.tiers[name].fallbackModels.push(models[0]?.selector ?? "");
+    const model = selectableModels[0]?.selector ?? "";
+    next.tiers[name].fallbackModels.push(modelSpecFor(model, preferredThinkingForModel(model, models)));
     updateTiers(next);
   };
 
@@ -800,7 +906,7 @@ export default function PiPanel({
             className="button"
             onClick={() => void applyTiers()}
             disabled={!canApply}
-            title={!canApply ? "存在空模型或 shadowed provider 冲突" : "写入 settings.json 的 “pi-roster” 配置块"}
+            title={!canApply ? "存在不完整 model spec 或 shadowed provider 冲突" : "写入 settings.json 的 “pi-roster” 配置块"}
           >
             {saving ? "Applying…" : saved ? "Applied" : "Apply"}
           </button>
@@ -923,6 +1029,11 @@ export default function PiPanel({
           </section>
 
           {snapshot?.warnings.map(warning => <div className="warning-box" key={warning}>{warning}</div>)}
+          {invalidModelSpecs.length > 0 && (
+            <div className="warning-box">
+              {invalidModelSpecs.map(conflict => <div key={conflict}>{conflict}</div>)}
+            </div>
+          )}
           {shadowConflicts.length > 0 && (
             <div className="warning-box">
               {shadowConflicts.map(conflict => <div key={conflict}>{conflict}</div>)}
@@ -955,7 +1066,6 @@ export default function PiPanel({
                   key={row.agent}
                   onClick={() => jumpToTier(row.tierName)}
                   disabled={!row.tierName}
-                  title={row.useCase || undefined}
                 >
                   <span className="agent-summary-name">{row.agent}</span>
                   <span>
@@ -1012,13 +1122,6 @@ export default function PiPanel({
                       </div>
                     </div>
 
-                    <input
-                      className="tier-usecase-input"
-                      value={tier.useCase}
-                      onChange={event => updateTierField(name, "useCase", event.target.value)}
-                      placeholder="使用场景：什么时候用这个 Tier，比如“日常多文件编辑、常规审查”"
-                      aria-label="使用场景"
-                    />
 
                     <div className="tier-models">
                       <div className="tier-model-row">
@@ -1031,12 +1134,13 @@ export default function PiPanel({
                             onChange={value => updateTierModel(name, value)}
                           />
                         </div>
-                        <label className="field-group thinking-field">
-                          <span>Thinking</span>
-                          <select value={tier.thinking} onChange={event => updateTierField(name, "thinking", event.target.value)}>
-                            {thinkingOptionsForModel(tier.model, models).map(level => <option value={level} key={level}>{level}</option>)}
-                          </select>
-                        </label>
+                        <div className="tier-model-controls">
+                          <PiThinkingSelect
+                            value={tier.model}
+                            models={models}
+                            onChange={value => updateTierModel(name, value)}
+                          />
+                        </div>
                       </div>
                       {tier.fallbackModels.map((selector, index) => (
                         <div className="tier-model-row" key={index}>
@@ -1049,7 +1153,14 @@ export default function PiPanel({
                               onChange={value => updateFallback(name, index, value)}
                             />
                           </div>
-                          <button className="icon-button danger" onClick={() => removeFallback(name, index)} aria-label="Remove fallback">×</button>
+                          <div className="tier-model-controls">
+                            <PiThinkingSelect
+                              value={selector}
+                              models={models}
+                              onChange={value => updateFallback(name, index, value)}
+                            />
+                            <button className="icon-button danger" onClick={() => removeFallback(name, index)} aria-label="Remove fallback">×</button>
+                          </div>
                         </div>
                       ))}
                       <button className="button quiet compact" onClick={() => addFallback(name)}>添加 fallback</button>
