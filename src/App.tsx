@@ -76,6 +76,7 @@ type Preset = {
   customRoleValues: Record<string, string>;
   reviewerFollowsSlow: boolean;
   securityReviewerFollowsSlow: boolean;
+  agentModelOverrides?: Record<string, string>;
   routingSettings?: RoutingSettings;
   shadowedProviders?: string[];
   updatedAt: string;
@@ -210,9 +211,6 @@ const AGENT_OVERRIDE_KEY_LOOKUP: Record<"reviewer" | "securityReviewer", true> =
 
 const MODEL_ROLE_DEFINITIONS = SLOT_DEFINITIONS.filter(
   definition => !Object.hasOwn(AGENT_OVERRIDE_KEY_LOOKUP, definition.key)
-);
-const BUILTIN_AGENT_OVERRIDE_DEFINITIONS = SLOT_DEFINITIONS.filter(
-  definition => Object.hasOwn(AGENT_OVERRIDE_KEY_LOOKUP, definition.key)
 );
 
 const EFFORT_LABELS: Record<string, string> = {
@@ -579,6 +577,9 @@ function parsePreset(value: unknown): Preset | null {
     customRoleValues,
     reviewerFollowsSlow: record.reviewerFollowsSlow !== false,
     securityReviewerFollowsSlow: record.securityReviewerFollowsSlow !== false,
+    agentModelOverrides: Object.hasOwn(record, "agentModelOverrides")
+      ? recordOfStrings(record.agentModelOverrides)
+      : undefined,
     routingSettings: parseRoutingSettings(record.routingSettings),
     shadowedProviders,
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : new Date(0).toISOString()
@@ -1234,6 +1235,108 @@ function SlotCard({
     </article>
   );
 }
+function AgentOverrideCard({
+  name,
+  override,
+  inheritedModel,
+  models,
+  filter,
+  shadowedProviders,
+  followsSlow,
+  slowFollowAgent,
+  onChange,
+  onFollowChange,
+  onEnable
+}: {
+  name: string;
+  override: string;
+  inheritedModel: string;
+  models: ModelOption[];
+  filter: string;
+  shadowedProviders: string[];
+  followsSlow: boolean;
+  slowFollowAgent?: "reviewer" | "security-reviewer";
+  onChange: (value: string) => void;
+  onFollowChange?: (follow: boolean) => void;
+  onEnable: () => void;
+}) {
+  const isReviewer = slowFollowAgent === "reviewer";
+  const isSecurityReviewer = slowFollowAgent === "security-reviewer";
+  const followsSlowControl = Boolean(slowFollowAgent);
+  const definition = SLOT_DEFINITIONS.find(item =>
+    (isReviewer && item.key === "reviewer") || (isSecurityReviewer && item.key === "securityReviewer")
+  );
+  const hasOverride = Boolean(override.trim());
+  const effectiveValue = followsSlowControl && followsSlow ? inheritedModel : override;
+  const effectiveProvider = providerForSelector(effectiveValue);
+  const isShadowed = Boolean(effectiveProvider && shadowedProviders.includes(effectiveProvider));
+  const modelError = effectiveValue ? modelSelectorError(effectiveValue, models) : "";
+  const isInvalid = Boolean(effectiveValue && (isShadowed || modelError));
+  const inheritedText = inheritedModel || "Agent Markdown / OMP 默认策略";
+
+  return (
+    <article className={`slot-card ${definition?.color ?? "cyan"}${isInvalid ? " invalid" : ""}`}>
+      <div className="slot-header">
+        <div className="slot-heading">
+          <span className="slot-dot" />
+          <div>
+            <div className="slot-title-line">
+              <h2>{definition?.title ?? name}</h2>
+              <span className="eyebrow">{definition?.eyebrow ?? "Agent · 自定义"}</span>
+              <code className="config-path">task.agentModelOverrides.{name}</code>
+            </div>
+            <p>{definition?.description ?? `自定义 ${name} Agent 的模型覆盖；留空则使用 Agent 定义的 model。`}</p>
+          </div>
+        </div>
+        <div className="slot-header-meta">
+          {isInvalid && (
+            <span className="invalid-badge" title={modelError || "配置使用了 shadowed provider"}>非法</span>
+          )}
+        </div>
+      </div>
+
+      {followsSlowControl && onFollowChange ? (
+        <div className="reviewer-mode">
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={followsSlow}
+              onChange={event => onFollowChange(event.target.checked)}
+            />
+            <span className="switch" aria-hidden="true" />
+            <span>跟随 Slow 角色</span>
+          </label>
+        </div>
+      ) : !hasOverride ? (
+        <div className="agent-override-empty">
+          <div>
+            <span>未设置覆盖</span>
+            <code>{inheritedText}</code>
+          </div>
+          <button className="button compact" onClick={onEnable}>设置覆盖</button>
+        </div>
+      ) : (
+        <div className="reviewer-mode agent-override-active">
+          <span className="switch-row">已设置模型覆盖</span>
+          <button className="button quiet compact" onClick={() => onChange("")}>清除覆盖</button>
+        </div>
+      )}
+
+      {followsSlowControl && followsSlow && (
+        <code className="inherited-model">{effectiveValue || "尚未选择"}</code>
+      )}
+      {((followsSlowControl && !followsSlow) || (!followsSlowControl && hasOverride)) && (
+        <ModelPicker
+          value={override}
+          models={models}
+          filter={filter}
+          shadowedProviders={shadowedProviders}
+          onChange={onChange}
+        />
+      )}
+    </article>
+  );
+}
 
 function CustomRoleCard({
   customRole,
@@ -1563,6 +1666,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   const [pendingDeleteCustomRole, setPendingDeleteCustomRole] = useState("");
   const [customAgents, setCustomAgents] = useState<CustomAgent[]>([]);
   const [agentEditor, setAgentEditor] = useState<AgentEditor | null>(null);
+  const [agentModelOverrides, setAgentModelOverrides] = useState<Record<string, string>>({});
   const [reviewerFollowsSlow, setReviewerFollowsSlow] = useState(true);
   const [securityReviewerFollowsSlow, setSecurityReviewerFollowsSlow] = useState(true);
   const [shadowedProviders, setShadowedProviders] = useState<string[]>([]);
@@ -1603,10 +1707,12 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   }, [theme]);
 
   const applySnapshot = (next: ConfigSnapshot, localShadowedProviders: string[] = []) => {
-    const rawReviewer = next.agentModelOverrides.reviewer ?? "";
-    const rawSecurityReviewer = next.agentModelOverrides["security-reviewer"] ?? "";
+    const nextAgentModelOverrides = recordOfStrings(next.agentModelOverrides);
+    const rawReviewer = nextAgentModelOverrides.reviewer ?? "";
+    const rawSecurityReviewer = nextAgentModelOverrides["security-reviewer"] ?? "";
     const followsSlow = rawReviewer === "" || rawReviewer === "@slow";
     const securityFollowsSlow = rawSecurityReviewer === "" || rawSecurityReviewer === "@slow";
+    setAgentModelOverrides(nextAgentModelOverrides);
     setReviewerFollowsSlow(followsSlow);
     setSecurityReviewerFollowsSlow(securityFollowsSlow);
     setValues({
@@ -1700,13 +1806,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   }, [snapshot]);
 
   const selectedModelSlots = useMemo(() => {
-    const fixedAssignments = SLOT_DEFINITIONS.map(definition => {
-      if (definition.key === "reviewer" && reviewerFollowsSlow) {
-        return { label: definition.title, value: values.slow, base: splitSelector(values.slow).base, allowProviderWildcard: false };
-      }
-      if (definition.key === "securityReviewer" && securityReviewerFollowsSlow) {
-        return { label: definition.title, value: values.slow, base: splitSelector(values.slow).base, allowProviderWildcard: false };
-      }
+    const fixedAssignments = MODEL_ROLE_DEFINITIONS.map(definition => {
       const value = values[definition.key];
       return { label: definition.title, value, base: splitSelector(value).base, allowProviderWildcard: false };
     });
@@ -1724,9 +1824,16 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         allowProviderWildcard: true
       }))
     );
-    return [...fixedAssignments, ...customAssignments, ...fallbackAssignments]
+    const agentOverrideAssignments = Object.entries(agentModelOverrides).map(([agentName, value]) => ({
+      label: `Agent ${agentName}`,
+      value,
+      base: splitSelector(value).base,
+      allowProviderWildcard: false
+    }));
+    return [...fixedAssignments, ...customAssignments, ...agentOverrideAssignments, ...fallbackAssignments]
       .filter(item => item.base && !item.base.startsWith("@"));
-  }, [customRoles, reviewerFollowsSlow, routingSettings.retryFallbackChains, securityReviewerFollowsSlow, values]);
+  }, [agentModelOverrides, customRoles, routingSettings.retryFallbackChains, values]);
+
   const availableModels = snapshot?.models ?? [];
   const invalidSelections = selectedModelSlots.filter(item => {
     const provider = providerForSelector(item.value);
@@ -1743,6 +1850,14 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   const hasUnavailableAgents = invalidAgentModels.some(agent => isUnavailableModelSelector(agent.model, availableModels));
   const invalidAgentMarkdown = customAgents.filter(agent => Boolean(validateAgentMarkdown(agent.agentMarkdown)));
   const invalidAgents = [...new Set([...invalidAgentMarkdown, ...invalidAgentModels])];
+  const invalidAgentOverrides = Object.entries(agentModelOverrides).filter(([, value]) => {
+    const trimmed = value.trim();
+    if (!trimmed) return false;
+    const provider = providerForSelector(trimmed);
+    return shadowedProviders.includes(provider) || Boolean(modelSelectorError(trimmed, availableModels));
+  });
+  const hasUnavailableAgentOverrides = invalidAgentOverrides.some(([, value]) => isUnavailableModelSelector(value, availableModels));
+
   const routingErrors = useMemo(() => {
     const errors: string[] = [];
     const targets = new Set<string>();
@@ -1796,8 +1911,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     return errors;
   }, [availableModels, customRoles, routingSettings.retryFallbackChains, shadowedProviders, values]);
   const hasApplyErrors =
-    hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgents.length > 0 || routingErrors.length > 0;
-  const hasPresetErrors = hasInvalidSelections || invalidCustomRoles.length > 0 || routingErrors.length > 0;
+    hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgents.length > 0 || invalidAgentOverrides.length > 0 || routingErrors.length > 0;
+  const hasPresetErrors = hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgentOverrides.length > 0 || routingErrors.length > 0;
 
 
 
@@ -1816,6 +1931,14 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     ]);
     return [...roles].sort((left, right) => left.localeCompare(right));
   }, [customRoles, snapshot]);
+  const agentOverrideNames = useMemo(() => {
+    const names = new Set(["reviewer", "security-reviewer"]);
+    Object.keys(snapshot?.agentModelOverrides ?? {}).forEach(name => names.add(name));
+    Object.keys(agentModelOverrides).forEach(name => names.add(name));
+    customAgents.forEach(agent => names.add(agent.name));
+    return [...names].sort((left, right) => left.localeCompare(right));
+  }, [agentModelOverrides, customAgents, snapshot]);
+
   const agentRoleOptions = useMemo(() => roleNames.map(role => `@${role}`), [roleNames]);
 
   const emptyRoleSlots =
@@ -1826,6 +1949,18 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setSaved(false);
     setValues(current => ({ ...current, [key]: value }));
   };
+  const updateAgentOverride = (agentName: string, value: string) => {
+    setSaved(false);
+    setAgentModelOverrides(current => ({ ...current, [agentName]: value }));
+    if (agentName === "reviewer") {
+      setReviewerFollowsSlow(false);
+      setValues(current => ({ ...current, reviewer: value }));
+    } else if (agentName === "security-reviewer") {
+      setSecurityReviewerFollowsSlow(false);
+      setValues(current => ({ ...current, securityReviewer: value }));
+    }
+  };
+
   const updateRoutingSettings = (next: RoutingSettings) => {
     setSaved(false);
     setRoutingSettings(cloneRoutingSettings(next));
@@ -1847,12 +1982,9 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       ...SYSTEM_MODEL_ROLE_IDS
         .filter(systemRole => values[systemRole].trim() === alias)
         .map(systemRole => `modelRoles.${systemRole}`),
-      ...(!reviewerFollowsSlow && values.reviewer.trim() === alias
-        ? ["task.agentModelOverrides.reviewer"]
-        : []),
-      ...(!securityReviewerFollowsSlow && values.securityReviewer.trim() === alias
-        ? ["task.agentModelOverrides.security-reviewer"]
-        : []),
+      ...Object.entries(agentModelOverrides)
+        .filter(([, value]) => value.trim() === alias)
+        .map(([agentName]) => `task.agentModelOverrides.${agentName}`),
       ...customRoles
         .filter(customRole => customRole.role !== role && customRole.value.trim() === alias)
         .map(customRole => `modelRoles.${customRole.role}`),
@@ -2191,9 +2323,20 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
 
   const updateReviewerMode = (key: "reviewer" | "securityReviewer", follow: boolean) => {
     setSaved(false);
+    const agentName = key === "reviewer" ? "reviewer" : "security-reviewer";
     if (key === "reviewer") setReviewerFollowsSlow(follow);
     else setSecurityReviewerFollowsSlow(follow);
-    if (follow) setValues(current => ({ ...current, [key]: current.slow }));
+    if (follow) {
+      setAgentModelOverrides(current => ({ ...current, [agentName]: "" }));
+      setValues(current => ({ ...current, [key]: current.slow }));
+      return;
+    }
+    const currentOverride = agentModelOverrides[agentName]?.trim() ?? "";
+    const explicitValue = currentOverride && currentOverride !== "@slow"
+      ? currentOverride
+      : values.slow || values.default || availableModels[0]?.selector || "@default";
+    setAgentModelOverrides(current => ({ ...current, [agentName]: explicitValue }));
+    setValues(current => ({ ...current, [key]: explicitValue }));
   };
 
   const toggleProvider = (provider: string, shadow: boolean) => {
@@ -2226,6 +2369,17 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setValues({ ...EMPTY_VALUES, ...preset.values });
     setReviewerFollowsSlow(preset.reviewerFollowsSlow);
     setSecurityReviewerFollowsSlow(preset.securityReviewerFollowsSlow);
+    setAgentModelOverrides(current => {
+      const next = preset.agentModelOverrides ? { ...preset.agentModelOverrides } : { ...current };
+      if (!customAgents.some(agent => agent.name === "reviewer")) {
+        next.reviewer = preset.reviewerFollowsSlow ? "" : preset.values.reviewer;
+      }
+      if (!customAgents.some(agent => agent.name === "security-reviewer")) {
+        next["security-reviewer"] = preset.securityReviewerFollowsSlow ? "" : preset.values.securityReviewer;
+      }
+      return next;
+    });
+
     if (preset.routingSettings) setRoutingSettings(cloneRoutingSettings(preset.routingSettings));
     const visibleProviders = new Set((snapshot?.models ?? []).map(model => model.provider));
     setShadowedProviders(
@@ -2271,6 +2425,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       customRoleValues,
       reviewerFollowsSlow,
       securityReviewerFollowsSlow,
+      agentModelOverrides: { ...agentModelOverrides },
+
       routingSettings: cloneRoutingSettings(routingSettings),
       shadowedProviders: [...shadowedProviders],
       updatedAt: new Date().toISOString()
@@ -2298,6 +2454,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       customRoleValues,
       reviewerFollowsSlow,
       securityReviewerFollowsSlow,
+      agentModelOverrides: { ...agentModelOverrides },
+
       routingSettings: cloneRoutingSettings(routingSettings),
       shadowedProviders: [...shadowedProviders],
       updatedAt: new Date().toISOString()
@@ -2330,8 +2488,13 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     ]),
     removedModelRoles: [...removedModelRoles],
     agentModelOverrides: {
-      reviewer: reviewerFollowsSlow ? "" : values.reviewer,
-      "security-reviewer": securityReviewerFollowsSlow ? "" : values.securityReviewer
+      ...agentModelOverrides,
+      reviewer: customAgents.some(agent => agent.name === "reviewer")
+        ? agentModelOverrides.reviewer ?? ""
+        : reviewerFollowsSlow ? "" : values.reviewer,
+      "security-reviewer": customAgents.some(agent => agent.name === "security-reviewer")
+        ? agentModelOverrides["security-reviewer"] ?? ""
+        : securityReviewerFollowsSlow ? "" : values.securityReviewer
     },
     agentFiles: customAgents
       .filter(agent => agent.dirty)
@@ -2349,11 +2512,13 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
           ? routingErrors[0]
           : invalidCustomRoles.length
             ? "自定义模型 Role 缺少有效模型。"
-          : invalidAgentMarkdown.length
-            ? "存在无效 Agent Markdown。请打开对应 Agent 修复。"
-            : hasUnavailableSelections || hasUnavailableAgents
-              ? "存在非法选择：已配置模型不在 OMP 当前可用列表中。请更换 Model。"
-              : "存在非法选择：shadowed provider 不能应用。请勾选 Use 或更换 Model。"
+            : invalidAgentMarkdown.length
+              ? "存在无效 Agent Markdown。请打开对应 Agent 修复。"
+              : invalidAgentOverrides.length
+                ? "存在非法 Agent 模型覆盖。请更换 Model 或 Role。"
+                : hasUnavailableSelections || hasUnavailableAgents || hasUnavailableAgentOverrides
+                  ? "存在非法选择：已配置模型不在 OMP 当前可用列表中。请更换 Model。"
+                  : "存在非法选择：shadowed provider 不能应用。请勾选 Use 或更换 Model。"
       );
       return;
     }
@@ -2701,27 +2866,46 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
           <section className="agent-override-section">
             <div className="custom-role-heading">
               <div>
-                <span className="section-kicker">BUILT-IN AGENT MODEL OVERRIDE</span>
-                <h2>内建 Agent 模型覆盖</h2>
-                <p>Reviewer 与 Security Reviewer 都是内建 Agent，不是 Role；这里仅配置它们使用的模型。</p>
+                <span className="section-kicker">AGENT MODEL OVERRIDES</span>
+                <h2>Agent 模型覆盖</h2>
+                <p>按已发现 Agent 与现有 task.agentModelOverrides 动态显示；留空表示使用 Agent 自身的 model 定义。</p>
               </div>
+              <strong>{agentOverrideNames.length}</strong>
             </div>
             <div className="slot-list">
-              {BUILTIN_AGENT_OVERRIDE_DEFINITIONS.map(definition => (
-                <SlotCard
-                  key={definition.key}
-                  definition={definition}
-                  value={values[definition.key]}
-                  models={snapshot?.models ?? []}
-                  filter={filter}
-                  shadowedProviders={shadowedProviders}
-                  reviewerFollowsSlow={reviewerFollowsSlow}
-                  securityReviewerFollowsSlow={securityReviewerFollowsSlow}
-                  slowValue={values.slow}
-                  onChange={value => updateValue(definition.key, value)}
-                  onFollowChange={updateReviewerMode}
-                />
-              ))}
+              {agentOverrideNames.map(agentName => {
+                const customAgent = customAgents.find(agent => agent.name === agentName);
+                const slowFollowAgent = !customAgent && agentName === "reviewer"
+                  ? "reviewer"
+                  : !customAgent && agentName === "security-reviewer"
+                    ? "security-reviewer"
+                    : undefined;
+                const followsSlow = slowFollowAgent === "reviewer"
+                  ? reviewerFollowsSlow
+                  : slowFollowAgent === "security-reviewer"
+                    ? securityReviewerFollowsSlow
+                    : false;
+                const inheritedModel = slowFollowAgent ? values.slow : customAgent?.model ?? "";
+                const override = agentModelOverrides[agentName] ?? "";
+                return (
+                  <AgentOverrideCard
+                    key={agentName}
+                    name={agentName}
+                    override={override}
+                    inheritedModel={inheritedModel}
+                    models={snapshot?.models ?? []}
+                    filter={filter}
+                    shadowedProviders={shadowedProviders}
+                    followsSlow={followsSlow}
+                    slowFollowAgent={slowFollowAgent}
+                    onChange={value => updateAgentOverride(agentName, value)}
+                    onFollowChange={slowFollowAgent
+                      ? follow => updateReviewerMode(slowFollowAgent === "reviewer" ? "reviewer" : "securityReviewer", follow)
+                      : undefined}
+                    onEnable={() => updateAgentOverride(agentName, customAgent?.model || "@slow")}
+                  />
+                );
+              })}
             </div>
           </section>
 

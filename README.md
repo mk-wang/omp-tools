@@ -7,7 +7,7 @@ OMP Model Studio 是一个基于 Tauri 2、React 19 和 Rust 的桌面控制面�
 ## 功能
 
 - **全部内建模型 Role**：配置 `default`、`smol`、`slow`、`plan`、`task`、`vision`、`designer`、`commit`、`tiny` 和 `advisor`。
-- **内建 Agent 模型覆盖**：分别配置 `reviewer` 与 `security-reviewer` 使用的模型；两者不是模型 Role。
+- **Agent 模型覆盖**：按已发现的 Agent 与现有 `task.agentModelOverrides.*` 动态配置模型覆盖；Reviewer 与 Security Reviewer 保留 Slow 继承开关。
 - **自定义模型 Role**：为独立的模型、成本或延迟边界增加自定义 Role；移除采用两步确认，并阻止删除仍被引用的 Role。
 - **自定义 Agent**：创建和编辑 `~/.omp/agent/agents/*.md`，使用 YAML frontmatter 描述名称、用途和模型 Role。
 - **模型能力与价格**：从 `omp models --json` 展示输入能力、thinking、上下文、输出上限及 input/output/cache 价格。
@@ -16,7 +16,7 @@ OMP Model Studio 是一个基于 Tauri 2、React 19 和 Rust 的桌面控制面�
 - **Provider 管理与一键切换**：Provider 列表严格来自 `omp models --json` 的当前可用结果（OMP 已按 `disabledProviders` 过滤模型）；勾掉某个 provider 的 Use 只在当前草稿中 shadow 它，并立即把每个受影响 Role 切换到其 fallback chain 中下一个可用候选（没有可用候选的 Role 会保持标红，需要手动选择）。Apply 不会读取或修改 OMP 真实的 `disabledProviders`。
 - **Custom provider**：填写 provider ID、API key、Base URL 和总 API type；总 Type 作为默认值，单个 model 可额外覆盖为另一种 API，通过 provider 的 `/models` endpoint 获取可用 model list，并自动尝试兼容的 rich catalog 读取 thinking effort；再勾选模型并立即独立写入 `~/.omp/agent/models.yml`；不依赖全局 Apply。
 - **直接编辑配置文件**：Header 可打开 `config.yml`，Custom Provider 区域可打开 `models.yml`，外部保存后点击“重新读取”加载最新内容。
-- **完整路由预设与主题**：在 WebView `localStorage` 中保存模型、路由策略和 provider 状态；Agent Markdown 保持独立。
+- **完整路由预设与主题**：在 WebView `localStorage` 中保存模型 Role、Agent 覆盖、路由策略和 provider 状态；Agent Markdown 保持独立。
 - **安全写入**：配置文件、`models.yml` 和 Agent Markdown 使用同目录临时文件写入后原子替换。
 
 ## Role 与 Agent 的边界
@@ -24,7 +24,7 @@ OMP Model Studio 是一个基于 Tauri 2、React 19 和 Rust 的桌面控制面�
 | 概念 | OMP 配置位置 | 作用 |
 | --- | --- | --- |
 | 模型 Role | `modelRoles.<role>` | 只决定模型选择，不定义执行权限、工具或任务 |
-| 内建 Agent 覆盖 | `task.agentModelOverrides.<agent>` | 覆盖 OMP 内建 Agent 使用的模型 |
+| Agent 模型覆盖 | `task.agentModelOverrides.<agent>` | 覆盖指定 Agent 使用的模型，不改变 Agent 的工具或提示词边界 |
 | 自定义 Agent | `~/.omp/agent/agents/<name>.md` | 定义执行者、提示词、工具边界和输出契约，并可引用任意模型 Role |
 
 模型选择器支持以下形式：
@@ -86,9 +86,8 @@ omp models --json
 3. 在全部内建模型 Role 卡片中选择模型和 thinking effort。
 4. 按需新增 custom provider，填写 API key、Base URL 和总 Type；点击获取完整 model list 后，应用会叠加可用的 thinking effort 元数据，并在每个 model 行单独覆盖 Type；点击 **保存 Provider** 后立即写入 `models.yml`。
 5. 配置全局 thinking、Advisor、Prewalk 与 fallback chain。
-6. 按需新增自定义 Role 或自定义 Agent，并调整 provider 状态。
-7. 确认没有非法选择后点击 **Apply**，将 Role、路由策略和 Agent 草稿写入 `config.yml` 与 Agent 文件；Custom Provider 不参与此操作。
-
+6. 按需新增自定义 Role 或自定义 Agent，在 Agent 模型覆盖区域调整已发现 Agent 的模型策略，并调整 provider 状态。
+7. 确认没有非法选择后点击 **Apply**，将 Role、Agent 覆盖、路由策略和 Agent 草稿写入 `config.yml` 与 Agent 文件；Custom Provider 不参与此操作。
 模型 Role、Agent 和路由策略编辑先保存在应用草稿中，不会在点击 **Apply** 前写入磁盘。Custom Provider 是例外：点击 **保存 Provider** 或确认删除后，会独立写入 `models.yml`。
 
 - Custom provider ID 只能包含字母、数字、`-`、`_`、`.`；Base URL 必须是 `http://` 或 `https://`；总 Type 和每个 model 的最终 Type 必须是 OMP 支持的 API；必须成功获取 model list，并至少勾选一个 model。

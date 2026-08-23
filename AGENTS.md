@@ -6,7 +6,7 @@
 ## Project Overview
 **OMP Model Studio** is a lightweight desktop control plane for [Oh My Pi (`omp`)](https://github.com/can1357/oh-my-pi). It provides a visual interface for managing and previewing:
 - **Built-in & Custom Model Roles**: Configures `modelRoles.*` selectors (e.g. `@slow`, `@smol`, `@tester`) across configured providers and thinking efforts.
-- **Built-in Agent Model Overrides**: Configures model selectors for bundled agents (`reviewer`, `security-reviewer`) under `task.agentModelOverrides.*`.
+- **Agent Model Overrides**: Dynamically configures discovered Agent selectors and existing `task.agentModelOverrides.*` entries; bundled reviewer cards retain Slow inheritance behavior.
 - **Custom Agent Definitions**: Visual authoring and editing for standalone agent definitions (`~/.omp/agent/agents/*.md`) with frontmatter metadata.
 - **Provider Enable/Disable & Model Presets**: Controls active provider scopes and saves local role preset snapshots.
 
@@ -99,7 +99,7 @@ bun run tauri build
 
 ### 1. Separation of Role vs. Agent
 - **Model Role** (`modelRoles.<role>`): Defines a model selector string (e.g. `openai-codex/gpt-5.6-terra:max`). It controls model choice, not execution permissions or tasks.
-- **Built-in Agent Model Override** (`task.agentModelOverrides.<agent>`): Overrides the model used by a bundled agent (`reviewer`, `security-reviewer`).
+- **Agent Model Override** (`task.agentModelOverrides.<agent>`): Overrides the model used by the named Agent; the Studio discovers custom Agent definitions and preserves existing override keys.
 - **Custom Agent** (`~/.omp/agent/agents/<name>.md`): Markdown file with YAML frontmatter defining name, description, model selector (e.g. `@tester`), and prompt body.
 
 ### 2. Frontend State & Validation Patterns

@@ -903,6 +903,11 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
 
 
 .reviewer-mode { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 35px; margin: -3px 0 12px; padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--slot-color), transparent 74%); border-radius: 7px; background: color-mix(in srgb, var(--slot-color), transparent 94%); }
+.agent-override-empty { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 35px; margin: -3px 0 12px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-soft); }
+.agent-override-empty > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.agent-override-empty span { color: var(--muted-strong); font-size: 11px; }
+.agent-override-empty code { overflow: hidden; color: var(--muted); font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-override-active { margin-bottom: 12px; }
 .inherited-model { display: block; min-width: 0; overflow: hidden; margin: -5px 0 12px; color: var(--muted-strong); font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .switch-row { gap: 8px; color: var(--muted-strong); cursor: pointer; font-size: 11px; }
 .switch-row input { position: absolute; width: 1px; height: 1px; opacity: 0; }
