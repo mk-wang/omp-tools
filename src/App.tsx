@@ -315,6 +315,11 @@ function modelSelectorError(value: string, models: ModelOption[], allowProviderW
 function firstModelSelector(value: string): string {
   return value.split(",").map(item => item.trim()).find(Boolean) ?? "";
 }
+function effectiveAgentModel(agent: CustomAgent, overrides: Record<string, string>): string {
+  const override = overrides[agent.name]?.trim();
+  return override || agent.model;
+}
+
 
 function createPresetId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
@@ -1400,19 +1405,21 @@ function CustomRoleCard({
 
 function CustomAgentCard({
   agent,
+  effectiveModel,
   models,
   shadowedProviders,
   onEdit
 }: {
   agent: CustomAgent;
+  effectiveModel: string;
   models: ModelOption[];
   shadowedProviders: string[];
   onEdit: () => void;
 }) {
   const validationError = validateAgentMarkdown(agent.agentMarkdown);
-  const agentProvider = providerForSelector(agent.model);
+  const agentProvider = providerForSelector(effectiveModel);
   const isShadowed = Boolean(agentProvider && shadowedProviders.includes(agentProvider));
-  const modelError = modelSelectorError(agent.model, models);
+  const modelError = modelSelectorError(effectiveModel, models);
   const isInvalid = Boolean(validationError || isShadowed || modelError);
   return (
     <article className={`agent-card${isInvalid ? " invalid" : ""}`}>
@@ -1427,7 +1434,7 @@ function CustomAgentCard({
       </div>
       <div className="agent-card-actions">
         <span>MODEL / ROLE</span>
-        <code>{agent.model}</code>
+        <code>{effectiveModel}</code>
         {isInvalid && (
           <span
             className="invalid-badge"
@@ -1816,6 +1823,24 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       base: splitSelector(customRole.value).base,
       allowProviderWildcard: false
     }));
+    const customAgentNames = new Set(customAgents.map(agent => agent.name));
+    const agentOverrideAssignments = Object.entries(agentModelOverrides)
+      .filter(([agentName]) => !customAgentNames.has(agentName))
+      .map(([agentName, value]) => ({
+        label: `Agent ${agentName}`,
+        value,
+        base: splitSelector(value).base,
+        allowProviderWildcard: false
+      }));
+    const customAgentAssignments = customAgents.map(agent => {
+      const value = effectiveAgentModel(agent, agentModelOverrides);
+      return {
+        label: `Agent ${agent.name}`,
+        value,
+        base: splitSelector(value).base,
+        allowProviderWildcard: false
+      };
+    });
     const fallbackAssignments = routingSettings.retryFallbackChains.flatMap(chain =>
       chain.selectors.map((selector, index) => ({
         label: `Fallback ${chain.target || "new"} ${index + 1}`,
@@ -1824,15 +1849,9 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         allowProviderWildcard: true
       }))
     );
-    const agentOverrideAssignments = Object.entries(agentModelOverrides).map(([agentName, value]) => ({
-      label: `Agent ${agentName}`,
-      value,
-      base: splitSelector(value).base,
-      allowProviderWildcard: false
-    }));
-    return [...fixedAssignments, ...customAssignments, ...agentOverrideAssignments, ...fallbackAssignments]
+    return [...fixedAssignments, ...customAssignments, ...agentOverrideAssignments, ...customAgentAssignments, ...fallbackAssignments]
       .filter(item => item.base && !item.base.startsWith("@"));
-  }, [agentModelOverrides, customRoles, routingSettings.retryFallbackChains, values]);
+  }, [agentModelOverrides, customAgents, customRoles, routingSettings.retryFallbackChains, values]);
 
   const availableModels = snapshot?.models ?? [];
   const invalidSelections = selectedModelSlots.filter(item => {
@@ -1844,10 +1863,13 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   const hasUnavailableSelections = invalidSelections.some(item => isUnavailableModelSelector(item.value, availableModels));
   const invalidCustomRoles = customRoles.filter(customRole => !customRole.value.trim());
   const invalidAgentModels = customAgents.filter(agent => {
-    const provider = providerForSelector(agent.model);
-    return shadowedProviders.includes(provider) || Boolean(modelSelectorError(agent.model, availableModels));
+    const value = effectiveAgentModel(agent, agentModelOverrides);
+    const provider = providerForSelector(value);
+    return shadowedProviders.includes(provider) || Boolean(modelSelectorError(value, availableModels));
   });
-  const hasUnavailableAgents = invalidAgentModels.some(agent => isUnavailableModelSelector(agent.model, availableModels));
+  const hasUnavailableAgents = invalidAgentModels.some(agent =>
+    isUnavailableModelSelector(effectiveAgentModel(agent, agentModelOverrides), availableModels)
+  );
   const invalidAgentMarkdown = customAgents.filter(agent => Boolean(validateAgentMarkdown(agent.agentMarkdown)));
   const invalidAgents = [...new Set([...invalidAgentMarkdown, ...invalidAgentModels])];
   const invalidAgentOverrides = Object.entries(agentModelOverrides).filter(([, value]) => {
@@ -2205,10 +2227,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
           return modelId === "*" || !selectedModels.has(modelId);
         })
         .map(item => item.label),
-      ...customAgents
-        .filter(agent => providerForSelector(agent.model) === id)
-        .filter(agent => !selectedModels.has(modelIdForProviderSelector(agent.model, id)))
-        .map(agent => `Agent ${agent.name}`)
     ];
     if (missingReferences.length > 0) {
       setCustomProviderSaveError(`不能取消使用 provider “${id}”的 model；仍被 ${missingReferences.join("、")} 引用。`);
@@ -2257,9 +2275,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       ...selectedModelSlots
         .filter(item => providerForSelector(item.value) === id)
         .map(item => item.label),
-      ...customAgents
-        .filter(agent => providerForSelector(agent.model) === id)
-        .map(agent => `Agent ${agent.name}`)
     ];
     if (references.length > 0) {
       setPendingDeleteCustomProvider("");
@@ -2758,9 +2773,9 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
 
           <section className="provider-card">
             <div className="catalog-heading"><span>PROVIDER LIST</span><strong>{providerNames.length}</strong></div>
-            <p className="provider-help">列表来自 OMP 当前可用模型（`omp models --json` 已按 disabledProviders 过滤）；取消 Use 只在当前草稿中 shadow 该 provider，并立即把受影响 Role 切换到各自 fallback chain 中下一个可用候选。Apply 只写入 Role、路由策略和 Agent，不会修改 OMP 的 disabledProviders。没有可用候选的 Role 会保持标红，需要手动选择。</p>
+            <p className="provider-help">列表来自 OMP 当前可用模型（`omp models --json` 已按 disabledProviders 过滤）；取消 Use 只在当前草稿中 shadow 该 provider，并把受影响 Role 切换到各自 fallback chain 中下一个可用候选。Agent 或 Agent override 若仍引用该 provider 会标红，需要手动更换。Apply 只写入 Role、路由策略和 Agent，不会修改 OMP 的 disabledProviders。</p>
             <div className="provider-key">
-              <span><i className="key-mark used-mark" /> Used by roles</span>
+              <span><i className="key-mark used-mark" /> Used by routes</span>
               <span><i className="key-mark shadowed-mark" /> Shadowed · draft only</span>
             </div>
             <div className="provider-list">
@@ -2957,6 +2972,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
                   <CustomAgentCard
                     key={agent.fileName}
                     agent={agent}
+                    effectiveModel={effectiveAgentModel(agent, agentModelOverrides)}
                     models={snapshot?.models ?? []}
                     shadowedProviders={shadowedProviders}
                     onEdit={() => editAgent(agent)}

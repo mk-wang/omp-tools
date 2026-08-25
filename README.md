@@ -13,7 +13,7 @@ OMP Model Studio 是一个基于 Tauri 2、React 19 和 Rust 的桌面控制面�
 - **模型能力与价格**：从 `omp models --json` 展示输入能力、thinking、上下文、输出上限及 input/output/cache 价格。
 - **路由策略**：配置全局 thinking、auto thinking 上限、Advisor runtime、Prewalk 和 retry model fallback。
 - **Fallback chain**：按 Role、具体模型或 provider wildcard 维护有序候选，并校验空值、重复、自循环和 shadowed provider。
-- **Provider 管理与一键切换**：Provider 列表严格来自 `omp models --json` 的当前可用结果（OMP 已按 `disabledProviders` 过滤模型）；勾掉某个 provider 的 Use 只在当前草稿中 shadow 它，并立即把每个受影响 Role 切换到其 fallback chain 中下一个可用候选（没有可用候选的 Role 会保持标红，需要手动选择）。Apply 不会读取或修改 OMP 真实的 `disabledProviders`。
+- **Provider 管理与一键切换**：Provider 列表严格来自 `omp models --json` 的当前可用结果（OMP 已按 `disabledProviders` 过滤模型）；勾掉某个 provider 的 Use 只在当前草稿中 shadow 它，并立即把每个受影响 Role 切换到其 fallback chain 中下一个可用候选。被 Agent 或 Agent override 使用的 provider 会显示为 Used；若仍引用 shadowed provider 会标红并阻止 Apply。Apply 不会读取或修改 OMP 真实的 `disabledProviders`。
 - **Custom provider**：填写 provider ID、API key、Base URL 和总 API type；总 Type 作为默认值，单个 model 可额外覆盖为另一种 API，通过 provider 的 `/models` endpoint 获取可用 model list，并自动尝试兼容的 rich catalog 读取 thinking effort；再勾选模型并立即独立写入 `~/.omp/agent/models.yml`；不依赖全局 Apply。
 - **直接编辑配置文件**：Header 可打开 `config.yml`，Custom Provider 区域可打开 `models.yml`，外部保存后点击“重新读取”加载最新内容。
 - **完整路由预设与主题**：在 WebView `localStorage` 中保存模型 Role、Agent 覆盖、路由策略和 provider 状态；Agent Markdown 保持独立。
@@ -95,7 +95,7 @@ omp models --json
 - 自定义 Role 名称不能覆盖 OMP 系统 Role，且必须以小写字母开头，只能包含小写字母、数字、`-`、`_`。
 - 自定义 Role 必须选择模型。
 - Agent Markdown 必须包含 `name`、`description`、`model` 三个 frontmatter 字段，并包含非空正文。
-- shadowed provider 不能继续被模型 Role 使用。
+- shadowed provider 不能继续被模型 Role、Agent 或 Agent override 使用。
 - 已配置但不在当前 `omp models --json` 返回列表中的直接模型 selector 会被标记为非法。
 - Fallback target 必须唯一且至少有一个候选；候选不能留空、重复、回退到自身或继续使用 shadowed provider。
 - 空白的全局策略控件表示继承 OMP 默认，不会强行写入一个覆盖值。
