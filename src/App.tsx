@@ -2219,7 +2219,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       setCustomProviderSaveError(validationError);
       return;
     }
-    const missingReferences = [
+    const missingReferences = [...new Set([
       ...selectedModelSlots
         .filter(item => providerForSelector(item.value) === id)
         .filter(item => {
@@ -2227,7 +2227,14 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
           return modelId === "*" || !selectedModels.has(modelId);
         })
         .map(item => item.label),
-    ];
+      ...customAgents
+        .filter(agent => providerForSelector(agent.model) === id)
+        .filter(agent => {
+          const modelId = modelIdForProviderSelector(agent.model, id);
+          return modelId === "*" || !selectedModels.has(modelId);
+        })
+        .map(agent => `Agent ${agent.name}`)
+    ])];
     if (missingReferences.length > 0) {
       setCustomProviderSaveError(`不能取消使用 provider “${id}”的 model；仍被 ${missingReferences.join("、")} 引用。`);
       return;
@@ -2271,11 +2278,14 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       setPendingDeleteCustomProvider(id);
       return;
     }
-    const references = [
+    const references = [...new Set([
       ...selectedModelSlots
         .filter(item => providerForSelector(item.value) === id)
         .map(item => item.label),
-    ];
+      ...customAgents
+        .filter(agent => providerForSelector(agent.model) === id)
+        .map(agent => `Agent ${agent.name}`)
+    ])];
     if (references.length > 0) {
       setPendingDeleteCustomProvider("");
       setError(`不能移除 provider “${id}”；仍被 ${references.join("、")} 使用。`);
