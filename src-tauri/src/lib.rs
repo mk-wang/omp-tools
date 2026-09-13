@@ -10,7 +10,7 @@ use std::{
 };
 
 const THINKING_LEVELS: [&str; 7] = ["minimal", "low", "medium", "high", "xhigh", "max", "off"];
-const RICH_MODEL_CATALOG_CLIENT_VERSION: &str = "0.144.0";
+const RICH_MODEL_CATALOG_CLIENT_VERSION: &str = "0.144.1";
 const CONFIGURED_THINKING_LEVELS: [&str; 8] = [
     "auto", "minimal", "low", "medium", "high", "xhigh", "max", "off",
 ];
@@ -933,7 +933,6 @@ fn set_nested_fallback_chains(root: &mut YamlValue, path: &[&str], chains: &[Fal
     set_nested_value(root, path, value);
 }
 
-
 fn valid_custom_provider_id(id: &str) -> bool {
     let mut characters = id.chars();
     matches!(characters.next(), Some(first) if first.is_ascii_alphanumeric())
@@ -1121,6 +1120,7 @@ fn custom_provider_yaml(existing: Option<&YamlValue>, provider: &CustomProviderS
                 if let Some(metadata) = model_metadata.get(id.as_str()) {
                     apply_omp_model_capabilities(&mut model_config, metadata);
                 }
+                apply_omp_session_header_compat(&mut model_config, *api);
                 retained_models.push(YamlValue::Mapping(model_config));
             }
         }
@@ -1138,6 +1138,7 @@ fn custom_provider_yaml(existing: Option<&YamlValue>, provider: &CustomProviderS
                 YamlValue::String(model.api.trim().to_string()),
             );
             apply_omp_model_capabilities(&mut model_value, model);
+            apply_omp_session_header_compat(&mut model_value, model.api.trim());
             retained_models.push(YamlValue::Mapping(model_value));
         }
     }
@@ -1571,6 +1572,30 @@ fn supports_effort_model_metadata(api: &str) -> bool {
             | "azure-openai-responses"
     )
 }
+/**
+ * Custom provider routes do not match OMP's built-in OpenCode provider names;
+ * mirror the generated session identity for the OpenAI transports so a proxy
+ * can forward it to an upstream session-affinity header.
+ */
+fn apply_omp_session_header_compat(config: &mut Mapping, api: &str) {
+    if !matches!(api, "openai-completions" | "openai-responses") {
+        return;
+    }
+    let compat_key = YamlValue::String("compat".to_string());
+    if !config.contains_key(&compat_key) {
+        config.insert(compat_key.clone(), YamlValue::Mapping(Mapping::new()));
+    }
+    let Some(compat) = config
+        .get_mut(&compat_key)
+        .and_then(YamlValue::as_mapping_mut)
+    else {
+        return;
+    };
+    let header_key = YamlValue::String("promptCacheSessionHeader".to_string());
+    if !compat.contains_key(&header_key) {
+        compat.insert(header_key, YamlValue::String("X-Session-Id".to_string()));
+    }
+}
 
 fn model_effort_levels(model: &CustomProviderSaveModel) -> Vec<String> {
     normalize_custom_provider_thinking_levels(&model.thinking)
@@ -1666,6 +1691,7 @@ fn parse_models_json(content: &str) -> Result<Vec<ModelOption>, String> {
         };
         let provider = json_string(object, "provider");
         let id = json_string(object, "id");
+        let selector = json_string(object, "selector");
         let name = {
             let value = json_string(object, "name");
             if value.is_empty() {
@@ -1712,7 +1738,7 @@ fn parse_models_json(content: &str) -> Result<Vec<ModelOption>, String> {
             })
         });
 
-        if let Some(model) = model_from_parts(
+        if let Some(mut model) = model_from_parts(
             provider,
             id,
             name,
@@ -1723,6 +1749,11 @@ fn parse_models_json(content: &str) -> Result<Vec<ModelOption>, String> {
             max_tokens,
             cost,
         ) {
+            // OMP's selector is the authoritative identity; older output has
+            // no selector field, so retain the provider/id fallback.
+            if !selector.is_empty() {
+                model.selector = selector;
+            }
             result.push(model);
         }
     }
@@ -1747,8 +1778,8 @@ fn dedupe_models(models: Vec<ModelOption>) -> Vec<ModelOption> {
 fn default_system_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(home) = home_dir() {
-        paths.push(home.join(".bun").join("bin"));
         paths.push(home.join(".local").join("bin"));
+        paths.push(home.join(".bun").join("bin"));
         paths.push(home.join(".cargo").join("bin"));
         paths.push(home.join(".nvm").join("versions").join("node"));
     }
@@ -1805,14 +1836,16 @@ fn executable_candidates(custom_path: Option<&str>) -> Vec<PathBuf> {
         candidates.extend(env::split_paths(&path).map(|directory| directory.join("omp")));
     }
     if let Ok(home) = home_dir() {
-        candidates.push(home.join(".bun").join("bin").join("omp"));
         candidates.push(home.join(".local").join("bin").join("omp"));
+        candidates.push(home.join(".bun").join("bin").join("omp"));
     }
     candidates.push(PathBuf::from("omp"));
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
     candidates
 }
 
-fn load_omp_models(custom_path: Option<&str>) -> Result<Vec<ModelOption>, String> {
+fn load_omp_models(custom_path: Option<&str>) -> Result<(Vec<ModelOption>, PathBuf), String> {
     let candidates = executable_candidates(custom_path);
     let mut failure_reasons = Vec::new();
     for candidate in &candidates {
@@ -1836,7 +1869,8 @@ fn load_omp_models(custom_path: Option<&str>) -> Result<Vec<ModelOption>, String
             failure_reasons.push(format!("{}: 进程退出码 {status_code}", candidate.display()));
             continue;
         }
-        return parse_models_json(&String::from_utf8_lossy(&output.stdout));
+        let models = parse_models_json(&String::from_utf8_lossy(&output.stdout))?;
+        return Ok((models, candidate.clone()));
     }
 
     if let Some(custom) = custom_path.map(str::trim).filter(|value| !value.is_empty()) {
@@ -1877,7 +1911,7 @@ fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapsh
 
     let mut warnings = Vec::new();
     let agent_files = load_agent_files(&agent, &mut warnings);
-    let models = load_omp_models(custom_omp_path)?;
+    let (models, model_executable) = load_omp_models(custom_omp_path)?;
 
     Ok(ConfigSnapshot {
         config_path: display_path(&config),
@@ -1885,7 +1919,7 @@ fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapsh
         model_roles,
         agent_model_overrides,
         models,
-        model_source: "omp models --json".to_string(),
+        model_source: format!("{} · omp models --json", display_path(&model_executable)),
         agent_files,
         routing_settings,
         custom_providers: load_custom_providers(&models_root),
@@ -2163,11 +2197,43 @@ fn pi_executable_candidates(custom_path: Option<&str>) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     candidates.push(PathBuf::from("/opt/homebrew/bin/pi"));
     if let Ok(home) = home_dir() {
-        candidates.push(home.join(".bun").join("bin").join("pi"));
         candidates.push(home.join(".local").join("bin").join("pi"));
+        candidates.push(home.join(".bun").join("bin").join("pi"));
     }
     candidates.push(PathBuf::from("pi"));
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
     candidates
+}
+fn load_pi_models(custom_path: Option<&str>) -> Result<(Vec<PiModelOption>, PathBuf), String> {
+    let candidates = pi_executable_candidates(custom_path);
+    let mut failure_reasons = Vec::new();
+    for candidate in &candidates {
+        let mut command = Command::new(candidate);
+        command.arg("--list-models").env("NO_COLOR", "1");
+        command.env("PATH", build_subprocess_path(candidate.parent()));
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(error) => {
+                failure_reasons.push(format!("{}: {error}", candidate.display()));
+                continue;
+            }
+        };
+        if !output.status.success() {
+            let status_code = output
+                .status
+                .code()
+                .map_or("terminated".to_string(), |code| code.to_string());
+            failure_reasons.push(format!("{}: 进程退出码 {status_code}", candidate.display()));
+            continue;
+        }
+        let models = parse_pi_models_table(&String::from_utf8_lossy(&output.stdout));
+        return Ok((models, candidate.clone()));
+    }
+    Err(format!(
+        "未找到可用的 pi 可执行文件或无法通过 `pi --list-models` 读取模型。\n尝试详情：\n{}",
+        failure_reasons.join("\n")
+    ))
 }
 
 fn parse_size_token(token: &str) -> Option<u64> {
@@ -2208,38 +2274,6 @@ fn parse_pi_models_table(content: &str) -> Vec<PiModelOption> {
         });
     }
     models
-}
-
-fn load_pi_models(custom_path: Option<&str>) -> Result<Vec<PiModelOption>, String> {
-    let candidates = pi_executable_candidates(custom_path);
-    let mut failure_reasons = Vec::new();
-    for candidate in &candidates {
-        let mut command = Command::new(candidate);
-        command.arg("--list-models").env("NO_COLOR", "1");
-        command.env("PATH", build_subprocess_path(candidate.parent()));
-        let output = match command.output() {
-            Ok(output) => output,
-            Err(error) => {
-                failure_reasons.push(format!("{}: {error}", candidate.display()));
-                continue;
-            }
-        };
-        if !output.status.success() {
-            let status_code = output
-                .status
-                .code()
-                .map_or("terminated".to_string(), |code| code.to_string());
-            failure_reasons.push(format!("{}: 进程退出码 {status_code}", candidate.display()));
-            continue;
-        }
-        return Ok(parse_pi_models_table(&String::from_utf8_lossy(
-            &output.stdout,
-        )));
-    }
-    Err(format!(
-        "未找到可用的 pi 可执行文件或无法通过 `pi --list-models` 读取模型。\n尝试详情：\n{}",
-        failure_reasons.join("\n")
-    ))
 }
 
 fn agent_name_from_markdown(content: &str) -> Option<String> {
@@ -2521,10 +2555,14 @@ fn load_pi_snapshot_from_disk(custom_pi_path: Option<&str>) -> Result<PiSnapshot
         ));
     }
     let shadowed_providers = json_string_list(settings.get("disabledProviders"));
-    let mut models = load_pi_models(custom_pi_path)?;
+    let (mut models, model_executable) = load_pi_models(custom_pi_path)?;
     let custom_providers = load_pi_custom_providers(&models_config);
     overlay_pi_model_capabilities(&mut models, &custom_providers);
     let agent_names = discover_pi_agent_names(&agent);
+    warnings.push(format!(
+        "模型目录来源：{} · pi --list-models",
+        display_path(&model_executable)
+    ));
 
     Ok(PiSnapshot {
         settings_path: display_path(&settings_path),
@@ -2877,7 +2915,6 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
     }
 
     validate_routing_settings(&request.routing_settings)?;
-
 
     let mut seen_files = HashSet::new();
     let mut seen_agent_names = HashSet::new();
@@ -3238,7 +3275,7 @@ mod tests {
         fs::write(agent.join("config.yml"), config_content).expect("test config should be written");
         fs::write(
             agent.join("models.yml"),
-            "providers:\n  gateway:\n    baseUrl: https://old.example.com/v1\n    api: openai-completions\n    apiKey: OLD_KEY\n    headers:\n      X-Team: keep\n    models:\n      - id: keep\n        name: Keep model\n        contextWindow: 123\n      - id: drop\n        name: Drop model\n  discovery-only:\n    baseUrl: https://discovery.example.com/v1\n    api: openai-completions\n    apiKey: DISCOVERY_KEY\n    discovery:\n      type: openai-models-list\n",
+            "providers:\n  gateway:\n    baseUrl: https://old.example.com/v1\n    api: openai-completions\n    apiKey: OLD_KEY\n    headers:\n      X-Team: keep\n    models:\n      - id: keep\n        name: Keep model\n        contextWindow: 123\n        compat:\n          supportsStore: true\n      - id: drop\n        name: Drop model\n  discovery-only:\n    baseUrl: https://discovery.example.com/v1\n    api: openai-completions\n    apiKey: DISCOVERY_KEY\n    discovery:\n      type: openai-models-list\n",
         )
         .expect("test models.yml should be written");
 
@@ -3254,6 +3291,7 @@ mod tests {
                     models: vec![
                         saved_model("keep", "openai-responses"),
                         saved_model("new", "anthropic-messages"),
+                        saved_model("new-openai", "openai-completions"),
                     ],
                 },
                 CustomProviderSave {
@@ -3290,7 +3328,7 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["keep", "new"]
+            vec!["keep", "new", "new-openai"]
         );
         assert!(
             providers
@@ -3353,6 +3391,35 @@ mod tests {
                 .and_then(|model| mapping_string(model, "api"))
                 .as_deref(),
             Some("openai-responses")
+        );
+        let keep_compat = models[0]
+            .as_mapping()
+            .and_then(|model| model.get(YamlValue::String("compat".to_string())))
+            .and_then(YamlValue::as_mapping)
+            .expect("existing OpenAI model compat mapping should survive");
+        assert_eq!(
+            keep_compat.get(YamlValue::String("supportsStore".to_string())),
+            Some(&YamlValue::Bool(true))
+        );
+        assert_eq!(
+            mapping_string(keep_compat, "promptCacheSessionHeader").as_deref(),
+            Some("X-Session-Id")
+        );
+        assert!(
+            models[1]
+                .as_mapping()
+                .and_then(|model| model.get(YamlValue::String("compat".to_string())))
+                .is_none(),
+            "non-OpenAI models should not receive the OpenCode session header"
+        );
+        assert_eq!(
+            models[2]
+                .as_mapping()
+                .and_then(|model| model.get(YamlValue::String("compat".to_string())))
+                .and_then(YamlValue::as_mapping)
+                .and_then(|compat| mapping_string(compat, "promptCacheSessionHeader"))
+                .as_deref(),
+            Some("X-Session-Id")
         );
         assert_eq!(yaml_model_id(&models[1]).as_deref(), Some("new"));
         assert_eq!(
@@ -3451,7 +3518,7 @@ mod tests {
         assert_eq!(merged[0].default_thinking_level.as_deref(), Some("low"));
         assert_eq!(
             custom_provider_rich_models_url("https://example.com/v1/models"),
-            "https://example.com/v1/models?client_version=0.144.0"
+            "https://example.com/v1/models?client_version=0.144.1"
         );
 
         let model = CustomProviderSaveModel {
@@ -3617,7 +3684,7 @@ mod tests {
                     assert!(request.contains("get /v1/models http/1.1"));
                     r#"{"data":[{"id":"model-a","name":"model-a"},{"id":"model-b"}]}"#
                 } else {
-                    assert!(request.contains("get /v1/models?client_version=0.144.0 http/1.1"));
+                    assert!(request.contains("get /v1/models?client_version=0.144.1 http/1.1"));
                     r#"{"models":[{"slug":"model-a","display_name":"Model A","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"ultra"}]}]}"#
                 };
                 write!(
@@ -3660,19 +3727,20 @@ mod tests {
     #[test]
     fn model_catalog_parser_keeps_limits_and_pricing() {
         let models = parse_models_json(
-            r#"{"models":[{"provider":"openai-codex","id":"gpt-5.6-terra","name":"GPT-5.6-Terra","reasoning":true,"thinking":["low","high","xhigh"],"input":["text","image"],"contextWindow":372000,"maxTokens":128000,"cost":{"input":2,"output":12,"cacheRead":0.2,"cacheWrite":2.5}}]}"#,
+            r#"{"models":[{"provider":"openai-codex","id":"gpt-6-astra","selector":"openai-codex/gpt-6-astra","name":"GPT-6-Astra","reasoning":true,"thinking":["low","medium","high","xhigh","max"],"input":["text","image"],"contextWindow":272000,"maxTokens":128000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}"#,
         )
         .expect("model catalog should parse");
 
         assert_eq!(models.len(), 1);
         let model = &models[0];
-        assert_eq!(model.context_window, Some(372_000));
+        assert_eq!(model.selector, "openai-codex/gpt-6-astra");
+        assert_eq!(model.context_window, Some(272_000));
         assert_eq!(model.max_tokens, Some(128_000));
         let cost = model.cost.as_ref().expect("pricing should be retained");
-        assert_eq!(cost.input, 2.0);
-        assert_eq!(cost.output, 12.0);
-        assert_eq!(cost.cache_read, 0.2);
-        assert_eq!(cost.cache_write, 2.5);
+        assert_eq!(cost.input, 0.0);
+        assert_eq!(cost.output, 0.0);
+        assert_eq!(cost.cache_read, 0.0);
+        assert_eq!(cost.cache_write, 0.0);
     }
 
     #[test]
@@ -3720,6 +3788,47 @@ mod tests {
     fn custom_omp_path_takes_precedence_in_candidates() {
         let candidates = executable_candidates(Some("/opt/custom/omp"));
         assert_eq!(candidates.first(), Some(&PathBuf::from("/opt/custom/omp")));
+    }
+
+    #[test]
+    fn fallback_candidates_prefer_local_bin_over_bun_bin() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_path = env::var_os("PATH");
+        env::set_var("PATH", "");
+        let omp_candidates = executable_candidates(None);
+        let pi_candidates = pi_executable_candidates(None);
+        match previous_path {
+            Some(path) => env::set_var("PATH", path),
+            None => env::remove_var("PATH"),
+        }
+
+        let home = home_dir().expect("home directory should be available");
+        let local_omp = home.join(".local").join("bin").join("omp");
+        let bun_omp = home.join(".bun").join("bin").join("omp");
+        let local_pi = home.join(".local").join("bin").join("pi");
+        let bun_pi = home.join(".bun").join("bin").join("pi");
+        assert!(
+            omp_candidates
+                .iter()
+                .position(|candidate| candidate == &local_omp)
+                .expect("local omp fallback should be present")
+                < omp_candidates
+                    .iter()
+                    .position(|candidate| candidate == &bun_omp)
+                    .expect("bun omp fallback should be present")
+        );
+        assert!(
+            pi_candidates
+                .iter()
+                .position(|candidate| candidate == &local_pi)
+                .expect("local pi fallback should be present")
+                < pi_candidates
+                    .iter()
+                    .position(|candidate| candidate == &bun_pi)
+                    .expect("bun pi fallback should be present")
+        );
     }
 
     #[test]

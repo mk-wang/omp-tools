@@ -14,7 +14,7 @@ OMP Model Studio 是一个基于 Tauri 2、React 19 和 Rust 的桌面控制面�
 - **路由策略**：配置全局 thinking、auto thinking 上限、Advisor runtime、Prewalk 和 retry model fallback。
 - **Fallback chain**：按 Role、具体模型或 provider wildcard 维护有序候选，并校验空值、重复、自循环和 shadowed provider。
 - **Provider 管理与一键切换**：Provider 列表严格来自 `omp models --json` 的当前可用结果（OMP 已按 `disabledProviders` 过滤模型）；勾掉某个 provider 的 Use 只在当前草稿中 shadow 它，并立即把每个受影响 Role 切换到其 fallback chain 中下一个可用候选。被 Agent 或 Agent override 使用的 provider 会显示为 Used；若仍引用 shadowed provider 会标红并阻止 Apply。Apply 不会读取或修改 OMP 真实的 `disabledProviders`。
-- **Custom provider**：填写 provider ID、API key、Base URL 和总 API type；总 Type 作为默认值，单个 model 可额外覆盖为另一种 API，通过 provider 的 `/models` endpoint 获取可用 model list，并自动尝试兼容的 rich catalog 读取 thinking effort；再勾选模型并立即独立写入 `~/.omp/agent/models.yml`；不依赖全局 Apply。
+- **Custom provider**：填写 provider ID、API key、Base URL 和总 API type；总 Type 作为默认值，单个 model 可额外覆盖为另一种 API，通过 provider 的 `/models` endpoint 获取可用 model list，并自动尝试兼容的 rich catalog 读取 thinking effort；保存时，`openai-completions` 和 `openai-responses` model 会自动补上 `compat.promptCacheSessionHeader: X-Session-Id`，便于经 CPA 等自定义网关透传会话身份；再勾选模型并立即独立写入 `~/.omp/agent/models.yml`；不依赖全局 Apply。
 - **直接编辑配置文件**：Header 可打开 `config.yml`，Custom Provider 区域可打开 `models.yml`，外部保存后点击“重新读取”加载最新内容。
 - **完整路由预设与主题**：在 WebView `localStorage` 中保存模型 Role、Agent 覆盖、路由策略和 provider 状态；Agent Markdown 保持独立。
 - **安全写入**：配置文件、`models.yml` 和 Agent Markdown 使用同目录临时文件写入后原子替换。
@@ -115,7 +115,7 @@ Run the release verification workflow and report concrete findings.
 ## 配置写入与数据边界
 
 - 后端只更新受管理的 YAML 映射：`config.yml` 中的 `modelRoles`、`task.agentModelOverrides`、thinking/Advisor/Prewalk 设置和 `retry.fallbackChains`；`disabledProviders` 不属于本工具的 OMP shadow 状态，Apply 会保留其现有值；其余未识别的 config 键也会保留。
-- `models.yml` 中只 upsert 当前 custom provider 明确管理的 `baseUrl`、`apiKey` 和勾选的 `models`；每个保存的 model 都带自己的 `api`，托管 provider 不再写 provider-level `api`。已有 model 元数据及 provider headers 等未管理字段保留。只有用户明确删除的 provider 才会移除；override-only/discovery provider 不会被编辑器接管。
+- `models.yml` 中只 upsert 当前 custom provider 明确管理的 `baseUrl`、`apiKey` 和勾选的 `models`；每个保存的 model 都带自己的 `api`，托管 provider 不再写 provider-level `api`。OpenAI Completions/Responses model 保存时默认写入 `compat.promptCacheSessionHeader: X-Session-Id`；已有 model 元数据、compat 字段及 provider headers 等未管理字段保留。只有用户明确删除的 provider 才会移除；override-only/discovery provider 不会被编辑器接管。
 - Provider shadow 状态是 WebView 本地草稿：只针对当前 `omp models --json` 返回的 provider 生效，不从 `disabledProviders` 载入，也不会写回该字段；预设可以保存这份本地 shadow 状态。
 - Custom provider 的 API key 只会由 **保存 Provider** 写入本机 `models.yml`；读取已有配置时只返回“已配置”状态，不把密钥返回到 WebView。
 - YAML 会经过 `serde_yaml` 重新序列化，因此格式和注释可能被重写；如需保留原始格式，请在写入前备份文件。

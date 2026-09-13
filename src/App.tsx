@@ -696,7 +696,7 @@ function ModelPicker({
   const parsed = splitSelector(value);
   const currentProvider = providerForSelector(value);
   const shadowedProviderSet = new Set(shadowedProviders);
-  const currentModel = models.find(model => `${model.provider}/${model.id}` === parsed.base);
+  const currentModel = models.find(model => model.selector === parsed.base);
   const providers = useMemo(() => {
     const names = new Set(
       models
