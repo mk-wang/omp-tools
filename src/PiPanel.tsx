@@ -579,7 +579,8 @@ export default function PiPanel({
       authNone: false,
       models: [],
       modelApiOverrides: {},
-      availableModels: []
+      availableModels: [],
+      discoveredModelIds: null
     });
   };
 
@@ -605,10 +606,6 @@ export default function PiPanel({
         ) {
           return current;
         }
-        const modelIds = new Set(models.map(model => model.id));
-        const staleSelectedModels = current.models
-          .filter(id => !modelIds.has(id))
-          .map(id => ({ id, name: id }));
         const modelApiOverrides = { ...current.modelApiOverrides };
         models.forEach(model => {
           if (model.api && model.api !== current.api && !Object.hasOwn(modelApiOverrides, model.id)) {
@@ -618,7 +615,8 @@ export default function PiPanel({
         return {
           ...current,
           modelApiOverrides,
-          availableModels: sortedCustomProviderModels([...models, ...staleSelectedModels])
+          discoveredModelIds: models.map(model => model.id),
+          availableModels: models
         };
       });
       if (models.length === 0) {
@@ -683,10 +681,10 @@ export default function PiPanel({
     setCustomProviderModelError("");
     setCustomProviderSaveError("");
     setCustomProviderModelLoading(false);
-    const availableModels = sortedCustomProviderModels(provider.models);
+    const configuredModels = sortedCustomProviderModels(provider.models);
     const api = inferredCustomProviderApi(
       provider.api,
-      availableModels,
+      configuredModels,
       PI_CUSTOM_PROVIDER_API_OPTIONS[0].value
     );
     setCustomProviderEditor({
@@ -698,9 +696,10 @@ export default function PiPanel({
       apiKey: "",
       apiKeyConfigured: provider.apiKeyConfigured,
       authNone: provider.authNone,
-      models: availableModels.map(model => model.id),
-      modelApiOverrides: customProviderApiOverrides(availableModels, api),
-      availableModels
+      models: configuredModels.map(model => model.id),
+      modelApiOverrides: customProviderApiOverrides(configuredModels, api),
+      availableModels: [],
+      discoveredModelIds: null
     });
   };
 
@@ -928,9 +927,9 @@ export default function PiPanel({
                   className="button compact quiet"
                   onClick={() => void openModelsFile()}
                   disabled={customProviderSaving}
-                  title="使用系统默认编辑器打开 models.json"
+                  title="在 Finder 中显示 models.json"
                 >
-                  直接编辑
+                  Reveal in Finder
                 </button>
                 <button className="button compact" onClick={startCustomProvider} disabled={customProviderSaving}>
                   新增 Provider

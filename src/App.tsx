@@ -781,7 +781,7 @@ function ModelPicker({
           >
             {availableModels.length === 0 && <option value="">No models</option>}
             {selectedBase && !availableModels.some(model => model.selector === selectedBase) && (
-              <option value={selectedBase}>{selectedBase.split("/").slice(1).join("/")}</option>
+              <option value={selectedBase}>{selectedBase.split("/").slice(1).join("/")} · 不可用</option>
             )}
             {availableModels.map(model => (
               <option value={model.selector} key={model.selector}>
@@ -2073,7 +2073,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       authNone: false,
       models: [],
       modelApiOverrides: {},
-      availableModels: []
+      availableModels: [],
+      discoveredModelIds: null,
     });
   };
 
@@ -2099,10 +2100,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         ) {
           return current;
         }
-        const modelIds = new Set(models.map(model => model.id));
-        const staleSelectedModels = current.models
-          .filter(id => !modelIds.has(id))
-          .map(id => ({ id, name: id }));
         const modelApiOverrides = { ...current.modelApiOverrides };
         models.forEach(model => {
           if (model.api && model.api !== current.api && !Object.hasOwn(modelApiOverrides, model.id)) {
@@ -2112,7 +2109,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         return {
           ...current,
           modelApiOverrides,
-          availableModels: sortedCustomProviderModels([...models, ...staleSelectedModels])
+          discoveredModelIds: models.map(model => model.id),
+          availableModels: models
         };
       });
       if (models.length === 0) {
@@ -2166,10 +2164,10 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setCustomProviderModelError("");
     setCustomProviderSaveError("");
     setCustomProviderModelLoading(false);
-    const availableModels = sortedCustomProviderModels(provider.models);
+    const configuredModels = sortedCustomProviderModels(provider.models);
     const api = inferredCustomProviderApi(
       provider.api,
-      availableModels,
+      configuredModels,
       CUSTOM_PROVIDER_API_OPTIONS[0].value
     );
     setCustomProviderEditor({
@@ -2181,9 +2179,10 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       apiKey: "",
       apiKeyConfigured: provider.apiKeyConfigured,
       authNone: provider.authNone,
-      models: availableModels.map(model => model.id),
-      modelApiOverrides: customProviderApiOverrides(availableModels, api),
-      availableModels
+      models: configuredModels.map(model => model.id),
+      modelApiOverrides: customProviderApiOverrides(configuredModels, api),
+      availableModels: [],
+      discoveredModelIds: null,
     });
   };
 
@@ -2621,9 +2620,9 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
             className="button quiet"
             onClick={() => void openEditableFile("config")}
             disabled={saving}
-            title="使用系统默认编辑器打开 config.yml"
+            title="在 Finder 中显示 config.yml"
           >
-            直接编辑
+            Reveal in Finder
           </button>
           <button className="button quiet" onClick={() => setTheme(theme === "light" ? "dark" : "light")}>
             {theme === "light" ? "☾ Dark" : "☀ Light"}
@@ -2736,16 +2735,16 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
                   className="button compact quiet"
                   onClick={() => void openEditableFile("models")}
                   disabled={customProviderSaving}
-                  title="使用系统默认编辑器打开 models.yml"
+                  title="在 Finder 中显示 models.yml"
                 >
-                  直接编辑
+                  Reveal in Finder
                 </button>
                 <button className="button compact" onClick={startCustomProvider} disabled={customProviderSaving}>
                   新增 Provider
                 </button>
               </div>
             </div>
-            <p className="provider-help">Provider 保存后立即写入 ~/.omp/agent/models.yml，不需要窗口右上角的 Apply。也可以直接编辑文件，保存后点击“重新读取”。API key 不会从已有文件回显；留空表示保留原 key。</p>
+            <p className="provider-help">Provider 保存后立即写入 ~/.omp/agent/models.yml，不需要窗口右上角的 Apply。也可以在 Finder 中定位文件，手动修改后点击“重新读取”。API key 不会从已有文件回显；留空表示保留原 key。</p>
             <div className="custom-provider-list">
               {customProviders.map(provider => (
                 <div className="custom-provider-row" key={provider.id}>

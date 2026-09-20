@@ -12,7 +12,9 @@ export type CustomProviderEditor = {
   models: string[];
   modelApiOverrides: Record<string, string>;
   availableModels: CustomProviderModel[];
+  discoveredModelIds: string[] | null;
 };
+
 
 export type CustomProviderApiOption = {
   value: string;
@@ -139,6 +141,21 @@ export function CustomProviderModal({
       : "";
   const error = idError || baseUrlError || apiError || modelApiError || keyError || modelError;
   const selectedModels = new Set(editor.models);
+  const discoveredModelIds = editor.discoveredModelIds;
+  const unavailableModelIds = discoveredModelIds === null
+    ? []
+    : editor.models.filter(modelId => !discoveredModelIds.includes(modelId));
+  const unavailableModelSet = new Set(unavailableModelIds);
+  const availableModelIds = new Set(editor.availableModels.map(model => model.id));
+  const staleSelectedModels = discoveredModelIds === null
+    ? []
+    : editor.models
+      .filter(modelId => !availableModelIds.has(modelId))
+      .map(id => ({ id, name: id }));
+  const modelOptions = sortedCustomProviderModels([
+    ...editor.availableModels,
+    ...staleSelectedModels
+  ]);
 
   const updateModelApi = (modelId: string, api: string) => {
     const modelApiOverrides = { ...editor.modelApiOverrides };
@@ -170,7 +187,7 @@ export function CustomProviderModal({
               {editor.mode === "create" ? (
                 <input
                   value={editor.id}
-                  onChange={event => onChange({ ...editor, id: event.target.value })}
+                  onChange={event => onChange({ ...editor, id: event.target.value, availableModels: [], discoveredModelIds: null })}
                   placeholder="例如 team-gateway"
                   autoFocus
                 />
@@ -182,7 +199,7 @@ export function CustomProviderModal({
               <span>Type</span>
               <select
                 value={editor.api}
-                onChange={event => onChange({ ...editor, api: event.target.value })}
+                onChange={event => onChange({ ...editor, api: event.target.value, availableModels: [], discoveredModelIds: null })}
               >
                 <option value="">选择 API type…</option>
                 {apiOptions.map(option => (
@@ -195,7 +212,7 @@ export function CustomProviderModal({
             <span>Base URL</span>
             <input
               value={editor.baseUrl}
-              onChange={event => onChange({ ...editor, baseUrl: event.target.value, availableModels: [], models: [], modelApiOverrides: {} })}
+              onChange={event => onChange({ ...editor, baseUrl: event.target.value, availableModels: [], models: [], modelApiOverrides: {}, discoveredModelIds: null })}
               placeholder="https://gateway.example.com/v1"
               spellCheck={false}
             />
@@ -205,7 +222,7 @@ export function CustomProviderModal({
             <input
               type="password"
               value={editor.apiKey}
-              onChange={event => onChange({ ...editor, apiKey: event.target.value })}
+              onChange={event => onChange({ ...editor, apiKey: event.target.value, availableModels: [], discoveredModelIds: null })}
               placeholder={editor.apiKeyConfigured ? "已配置；留空保持不变" : requireApiKey ? "输入 API key" : "可留空，使用 Pi auth.json 或环境变量"}
               autoComplete="new-password"
               spellCheck={false}
@@ -214,7 +231,7 @@ export function CustomProviderModal({
           <div className="modal-field">
             <div className="custom-provider-model-heading">
               <span>Models from provider</span>
-              <strong>{editor.models.length} / {editor.availableModels.length} selected</strong>
+              <strong>{discoveredModelIds === null ? `${editor.models.length} 已配置 · 待获取上游列表` : `${editor.models.length} / ${modelOptions.length} selected`}</strong>
             </div>
             <div className="custom-provider-model-toolbar">
               <button
@@ -226,16 +243,22 @@ export function CustomProviderModal({
               </button>
               <span>GET {editor.baseUrl.trim() || "<baseUrl>"}/models · 可选 rich catalog · Authorization: Bearer</span>
             </div>
+            {unavailableModelIds.length > 0 && (
+              <div className="custom-provider-model-warning" role="status">
+                上游当前未提供：{unavailableModelIds.join("、")}。保留配置不会删除它，但仍会标记为不可用；取消勾选后保存可移除。
+              </div>
+            )}
             <div className="custom-provider-model-list">
-              {editor.availableModels.map(model => {
+              {modelOptions.map(model => {
                 const selected = selectedModels.has(model.id);
+                const isUnavailable = unavailableModelSet.has(model.id);
                 const override = editor.modelApiOverrides[model.id] ?? "";
                 const metadata = [
                   model.name !== model.id ? model.name : "",
                   model.thinking?.length ? `thinking: ${model.thinking.join(", ")}` : ""
                 ].filter(Boolean).join(" · ");
                 return (
-                  <div className={`custom-provider-model-option${selected ? " is-selected" : ""}`} key={model.id}>
+                  <div className={`custom-provider-model-option${selected ? " is-selected" : ""}${isUnavailable ? " is-unavailable" : ""}`} key={model.id}>
                     <label className="custom-provider-model-selection">
                       <input
                         type="checkbox"
@@ -247,7 +270,10 @@ export function CustomProviderModal({
                             : editor.models.filter(id => id !== model.id)
                         })}
                       />
-                      <span className="custom-provider-model-id">{model.id}</span>
+                      <span className="custom-provider-model-id">
+                        {model.id}
+                        {isUnavailable && <em className="custom-provider-model-unavailable">上游不可用</em>}
+                      </span>
                       {metadata && <small>{metadata}</small>}
                     </label>
                     <select
@@ -264,7 +290,7 @@ export function CustomProviderModal({
                   </div>
                 );
               })}
-              {editor.availableModels.length === 0 && (
+              {modelOptions.length === 0 && (
                 <div className="empty-state">点击“获取 Model 列表”，读取 provider 的 /models。</div>
               )}
             </div>

@@ -241,23 +241,22 @@ fn editable_file(agent: &Path, kind: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn open_with_default_app(path: &Path) -> Result<(), String> {
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     let path = path.to_string_lossy().into_owned();
     #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(path).spawn();
+    let result = Command::new("open").arg("-R").arg(&path).spawn();
     #[cfg(target_os = "windows")]
-    let result = Command::new("cmd")
-        .arg("/C")
-        .arg("start")
-        .arg("")
-        .arg(path)
+    let result = Command::new("explorer")
+        .arg(format!("/select,{path}"))
         .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let result = Command::new("xdg-open").arg(path).spawn();
+    let result = Command::new("xdg-open")
+        .arg(Path::new(&path).parent().unwrap_or_else(|| Path::new(".")))
+        .spawn();
 
     result
         .map(|_| ())
-        .map_err(|error| format!("无法打开文件编辑器: {error}"))
+        .map_err(|error| format!("无法在文件管理器中显示文件: {error}"))
 }
 
 fn display_path(path: &Path) -> String {
@@ -2868,7 +2867,7 @@ fn open_config_file(kind: String) -> Result<(), String> {
         };
         return Err(format!("文件 {} 不存在，{next_step}", display_path(&path)));
     }
-    open_with_default_app(&path)
+    reveal_in_file_manager(&path)
 }
 
 #[tauri::command]
@@ -2876,7 +2875,7 @@ fn open_pi_models_file() -> Result<(), String> {
     let agent = pi_agent_dir()?;
     let path = pi_models_file(&agent);
     ensure_pi_models_file(&path)?;
-    open_with_default_app(&path)
+    reveal_in_file_manager(&path)
 }
 
 #[tauri::command]

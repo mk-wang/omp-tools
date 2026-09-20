@@ -681,6 +681,8 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
 }
 .custom-provider-model-option:hover { background: var(--panel); }
 .custom-provider-model-option.is-selected { border-color: var(--selected-border); color: var(--text-strong); background: var(--selected); }
+.custom-provider-model-option.is-unavailable { border-color: var(--warning-border); background: var(--warning-bg); }
+.custom-provider-model-option.is-selected.is-unavailable { background: color-mix(in srgb, var(--selected), var(--warning-bg) 35%); }
 .custom-provider-model-selection {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -707,6 +709,8 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
   overflow-wrap: anywhere;
 }
 .custom-provider-model-api { width: 100%; min-width: 0; padding: 5px 6px; font-size: 9px; }
+.custom-provider-model-warning { margin-top: 8px; padding: 8px 9px; border: 1px solid var(--warning-border); border-radius: 6px; color: var(--warning-text); background: var(--warning-bg); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.custom-provider-model-unavailable { margin-left: 7px; color: var(--warning-text); font-family: inherit; font-size: 9px; font-style: normal; font-weight: 700; white-space: nowrap; }
 
 .role-modal-header,
 .role-modal-footer {
@@ -824,9 +828,7 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
   font-size: 12px;
   line-height: 1.45;
 }
-.modal-validation.is-error {
-  color: var(--warning-text);
-}
+.modal-validation.is-error { color: var(--warning-text); }
 .role-modal-footer {
   border-top: 1px solid var(--border);
   color: var(--muted);
