@@ -30,6 +30,10 @@ type SlotKey =
   | "tiny"
   | "task"
   | "advisor"
+  | "image"
+  | "speech"
+  | "dictation"
+  | "judge"
   | "reviewer"
   | "securityReviewer";
 type ModelRoleKey = Exclude<SlotKey, "reviewer" | "securityReviewer">;
@@ -43,6 +47,8 @@ type SlotDefinition = {
   path: string;
   description: string;
   color: string;
+  /** Non-chat role: candidates come from `omp models --kind all`, not the chat list. */
+  kindRole?: boolean;
 };
 
 type CustomRole = {
@@ -172,6 +178,42 @@ const SLOT_DEFINITIONS: SlotDefinition[] = [
     color: "rose"
   },
   {
+    key: "image",
+    title: "Image",
+    eyebrow: "出图",
+    path: "modelRoles.image",
+    description: "generate_image 使用的出图模型；需要 kind=image，且 config.yml 里 generate_image.enabled 为 true。",
+    color: "violet",
+    kindRole: true
+  },
+  {
+    key: "speech",
+    title: "Speech",
+    eyebrow: "语音合成",
+    path: "modelRoles.speech",
+    description: "tts 工具使用的语音合成模型；需要 kind=tts。",
+    color: "amber",
+    kindRole: true
+  },
+  {
+    key: "dictation",
+    title: "Dictation",
+    eyebrow: "语音识别",
+    path: "modelRoles.dictation",
+    description: "stt 工具使用的转写模型；需要 kind=stt。",
+    color: "amber",
+    kindRole: true
+  },
+  {
+    key: "judge",
+    title: "Judge",
+    eyebrow: "评判",
+    path: "modelRoles.judge",
+    description: "judge 运行时使用的评判模型；接受 kind=judge / tiny / chat。",
+    color: "blue",
+    kindRole: true
+  },
+  {
     key: "securityReviewer",
     title: "Security Reviewer",
     eyebrow: "Agent · 安全审查",
@@ -190,7 +232,11 @@ const SYSTEM_MODEL_ROLE_IDS: ModelRoleKey[] = [
   "designer",
   "commit",
   "tiny",
-  "advisor"
+  "advisor",
+  "image",
+  "speech",
+  "dictation",
+  "judge"
 ];
 const SYSTEM_MODEL_ROLE_LOOKUP: Record<ModelRoleKey, true> = {
   default: true,
@@ -202,13 +248,24 @@ const SYSTEM_MODEL_ROLE_LOOKUP: Record<ModelRoleKey, true> = {
   designer: true,
   commit: true,
   tiny: true,
-  advisor: true
+  advisor: true,
+  image: true,
+  speech: true,
+  dictation: true,
+  judge: true
 };
 const AGENT_OVERRIDE_KEY_LOOKUP: Record<"reviewer" | "securityReviewer", true> = {
   reviewer: true,
   securityReviewer: true
 };
 
+// Kind roles, including `web`, which has no slot of its own: the backend still
+// classifies it as a system role, so it must not be listed as a deletable custom
+// role (the UI would offer a delete the backend rejects).
+const KIND_ROLE_KEYS = new Set<string>([
+  ...SLOT_DEFINITIONS.filter(definition => definition.kindRole).map(definition => definition.key),
+  "web"
+]);
 const MODEL_ROLE_DEFINITIONS = SLOT_DEFINITIONS.filter(
   definition => !Object.hasOwn(AGENT_OVERRIDE_KEY_LOOKUP, definition.key)
 );
@@ -241,6 +298,10 @@ const EMPTY_VALUES: SlotValues = {
   commit: "",
   tiny: "",
   advisor: "",
+  image: "",
+  speech: "",
+  dictation: "",
+  judge: "",
   reviewer: "",
   securityReviewer: ""
 };
@@ -576,6 +637,10 @@ function parsePreset(value: unknown): Preset | null {
       commit: storedValues.commit ?? "",
       tiny: storedValues.tiny ?? "",
       advisor: storedValues.advisor ?? "",
+      image: storedValues.image ?? "",
+      speech: storedValues.speech ?? "",
+      dictation: storedValues.dictation ?? "",
+      judge: storedValues.judge ?? "",
       reviewer: storedValues.reviewer ?? "",
       securityReviewer: storedValues.securityReviewer ?? ""
     },
@@ -1152,6 +1217,7 @@ function SlotCard({
   definition,
   value,
   models,
+  kindModels,
   filter,
   shadowedProviders,
   reviewerFollowsSlow,
@@ -1163,6 +1229,7 @@ function SlotCard({
   definition: SlotDefinition;
   value: string;
   models: ModelOption[];
+  kindModels?: ModelOption[];
   filter: string;
   shadowedProviders: string[];
   reviewerFollowsSlow: boolean;
@@ -1177,7 +1244,9 @@ function SlotCard({
   const effectiveValue = followsSlow ? slowValue : value;
   const effectiveProvider = providerForSelector(effectiveValue);
   const isShadowed = Boolean(effectiveProvider && shadowedProviders.includes(effectiveProvider));
-  const modelError = modelSelectorError(effectiveValue, models);
+  // A kind role must offer the non-chat catalog, not the chat list.
+  const pickerModels = definition.kindRole && kindModels ? kindModels : models;
+  const modelError = modelSelectorError(effectiveValue, pickerModels);
   const isInvalid = isShadowed || Boolean(modelError);
   const followKey = isSecurityReviewer ? "securityReviewer" : "reviewer";
   const isFollowable = isReviewer || isSecurityReviewer;
@@ -1230,7 +1299,7 @@ function SlotCard({
       {(!isFollowable || !followsSlow) && (
         <ModelPicker
           value={value}
-          models={models}
+          models={pickerModels}
           filter={filter}
           shadowedProviders={shadowedProviders}
           onChange={onChange}
@@ -1733,11 +1802,15 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       commit: next.modelRoles.commit ?? "",
       tiny: next.modelRoles.tiny ?? "",
       advisor: next.modelRoles.advisor ?? "",
+      image: next.modelRoles.image ?? "",
+      speech: next.modelRoles.speech ?? "",
+      dictation: next.modelRoles.dictation ?? "",
+      judge: next.modelRoles.judge ?? "",
       reviewer: followsSlow ? next.modelRoles.slow ?? "" : rawReviewer,
       securityReviewer: securityFollowsSlow ? next.modelRoles.slow ?? "" : rawSecurityReviewer
     });
     const nextCustomRoles = Object.entries(next.modelRoles)
-      .filter(([role]) => !Object.hasOwn(SYSTEM_MODEL_ROLE_LOOKUP, role))
+      .filter(([role]) => !Object.hasOwn(SYSTEM_MODEL_ROLE_LOOKUP, role) && !KIND_ROLE_KEYS.has(role))
       .map(([role, value]) => ({ role, value }))
       .sort((left, right) => left.role.localeCompare(right.role));
     setCustomRoles(nextCustomRoles);
@@ -1812,16 +1885,29 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     return [...names].sort((left, right) => left.localeCompare(right));
   }, [snapshot]);
 
+  const availableModels = snapshot?.models ?? [];
+  const kindModels = snapshot?.kindModels ?? [];
+
   const selectedModelSlots = useMemo(() => {
     const fixedAssignments = MODEL_ROLE_DEFINITIONS.map(definition => {
       const value = values[definition.key];
-      return { label: definition.title, value, base: splitSelector(value).base, allowProviderWildcard: false };
+      // A kind role's selector lives in the non-chat catalog, so it must be
+      // validated against that pool or every image/web role reads as unavailable.
+      const pool = definition.kindRole ? kindModels : availableModels;
+      return {
+        label: definition.title,
+        value,
+        base: splitSelector(value).base,
+        allowProviderWildcard: false,
+        pool
+      };
     });
     const customAssignments = customRoles.map(customRole => ({
       label: customRole.role,
       value: customRole.value,
       base: splitSelector(customRole.value).base,
-      allowProviderWildcard: false
+      allowProviderWildcard: false,
+      pool: availableModels
     }));
     const customAgentNames = new Set(customAgents.map(agent => agent.name));
     const agentOverrideAssignments = Object.entries(agentModelOverrides)
@@ -1830,7 +1916,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         label: `Agent ${agentName}`,
         value,
         base: splitSelector(value).base,
-        allowProviderWildcard: false
+        allowProviderWildcard: false,
+        pool: availableModels
       }));
     const customAgentAssignments = customAgents.map(agent => {
       const value = effectiveAgentModel(agent, agentModelOverrides);
@@ -1838,7 +1925,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         label: `Agent ${agent.name}`,
         value,
         base: splitSelector(value).base,
-        allowProviderWildcard: false
+        allowProviderWildcard: false,
+        pool: availableModels
       };
     });
     const fallbackAssignments = routingSettings.retryFallbackChains.flatMap(chain =>
@@ -1846,21 +1934,21 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         label: `Fallback ${chain.target || "new"} ${index + 1}`,
         value: selector,
         base: splitSelector(selector).base,
-        allowProviderWildcard: true
+        allowProviderWildcard: true,
+        pool: KIND_ROLE_KEYS.has(chain.target.trim()) ? kindModels : availableModels
       }))
     );
     return [...fixedAssignments, ...customAssignments, ...agentOverrideAssignments, ...customAgentAssignments, ...fallbackAssignments]
       .filter(item => item.base && !item.base.startsWith("@"));
-  }, [agentModelOverrides, customAgents, customRoles, routingSettings.retryFallbackChains, values]);
+  }, [agentModelOverrides, availableModels, customAgents, customRoles, kindModels, routingSettings.retryFallbackChains, values]);
 
-  const availableModels = snapshot?.models ?? [];
   const invalidSelections = selectedModelSlots.filter(item => {
     const provider = providerForSelector(item.value);
     return shadowedProviders.includes(provider)
-      || Boolean(modelSelectorError(item.value, availableModels, item.allowProviderWildcard));
+      || Boolean(modelSelectorError(item.value, item.pool, item.allowProviderWildcard));
   });
   const hasInvalidSelections = invalidSelections.length > 0;
-  const hasUnavailableSelections = invalidSelections.some(item => isUnavailableModelSelector(item.value, availableModels));
+  const hasUnavailableSelections = invalidSelections.some(item => isUnavailableModelSelector(item.value, item.pool));
   const invalidCustomRoles = customRoles.filter(customRole => !customRole.value.trim());
   const invalidAgentModels = customAgents.filter(agent => {
     const value = effectiveAgentModel(agent, agentModelOverrides);
@@ -1896,7 +1984,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       if (targetProvider && shadowedProviders.includes(targetProvider)) {
         errors.push(`Fallback target “${target}”使用了 shadowed provider “${targetProvider}”。`);
       }
-      if (isUnavailableModelSelector(target, availableModels)) {
+      const chainPool = KIND_ROLE_KEYS.has(target) ? kindModels : availableModels;
+      if (isUnavailableModelSelector(target, chainPool)) {
         errors.push(`Fallback target “${target}”使用了当前 OMP 不可用的模型。`);
       }
       if (chain.selectors.length === 0) {
@@ -1923,15 +2012,15 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         if (provider && shadowedProviders.includes(provider)) {
           errors.push(`Fallback target “${target}”使用了 shadowed provider “${provider}”。`);
         }
-        if (isUnavailableModelSelector(selector, availableModels)) {
+        if (isUnavailableModelSelector(selector, chainPool)) {
           errors.push(`Fallback target “${target}”使用了当前 OMP 不可用的模型 “${selector}”。`);
-        } else if (modelSelectorError(selector, availableModels, true)) {
+        } else if (modelSelectorError(selector, chainPool, true)) {
           errors.push(`Fallback target “${target}”使用了无效模型 selector “${selector}”。`);
         }
       });
     });
     return errors;
-  }, [availableModels, customRoles, routingSettings.retryFallbackChains, shadowedProviders, values]);
+  }, [availableModels, customRoles, kindModels, routingSettings.retryFallbackChains, shadowedProviders, values]);
   const hasApplyErrors =
     hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgents.length > 0 || invalidAgentOverrides.length > 0 || routingErrors.length > 0;
   const hasPresetErrors = hasInvalidSelections || invalidCustomRoles.length > 0 || invalidAgentOverrides.length > 0 || routingErrors.length > 0;
@@ -2866,6 +2955,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
                 definition={definition}
                 value={values[definition.key]}
                 models={snapshot?.models ?? []}
+                kindModels={snapshot?.kindModels ?? []}
                 filter={filter}
                 shadowedProviders={shadowedProviders}
                 reviewerFollowsSlow={reviewerFollowsSlow}
@@ -2932,7 +3022,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
               })}
             </div>
           </section>
-
           <section className="custom-role-section">
             <div className="custom-role-heading">
               <div>

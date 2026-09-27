@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value as YamlValue};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -21,7 +21,11 @@ const AUTO_THINKING_MAX_EFFORTS: [&str; 2] = ["xhigh", "max"];
 const SYSTEM_MODEL_ROLES: [&str; 10] = [
     "default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor",
 ];
-const CUSTOM_PROVIDER_APIS: [&str; 9] = [
+/// Non-chat roles OMP resolves against the catalog `kind` (and, for `web`, a
+/// `webSearch` grounding) rather than the chat pool. Mirrors
+/// `KIND_ROLE_IDS` in oh-my-pi's model-roles.ts.
+const KIND_MODEL_ROLES: [&str; 5] = ["image", "web", "speech", "dictation", "judge"];
+const CUSTOM_PROVIDER_APIS: [&str; 11] = [
     "openai-completions",
     "openai-responses",
     "openai-codex-responses",
@@ -31,6 +35,8 @@ const CUSTOM_PROVIDER_APIS: [&str; 9] = [
     "google-generative-ai",
     "google-gemini-cli",
     "google-vertex",
+    "openrouter-decisions",
+    "typesafe",
 ];
 const PI_CUSTOM_PROVIDER_APIS: [&str; 4] = [
     "openai-completions",
@@ -61,6 +67,11 @@ struct ModelOption {
     context_window: Option<u64>,
     max_tokens: Option<u64>,
     cost: Option<ModelCost>,
+    /// Catalog kind from `omp models --kind all`. Empty when that metadata pass
+    /// is unavailable; role validation is then skipped rather than guessed.
+    /// Note: `omp models --json` emits no `webSearch` field, so a chat model's
+    /// grounding is not observable here — see `accepts_kind_role`.
+    kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,6 +185,8 @@ struct ConfigSnapshot {
     model_roles: BTreeMap<String, String>,
     agent_model_overrides: BTreeMap<String, String>,
     models: Vec<ModelOption>,
+    /// Candidates for the non-chat kind roles, drawn from `omp models --kind all`.
+    kind_models: Vec<ModelOption>,
     model_source: String,
     agent_files: Vec<AgentDefinitionFile>,
     routing_settings: RoutingSettings,
@@ -268,6 +281,23 @@ fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// A role name OMP itself owns. Both the chat roles and the non-chat kind
+/// roles are built-in, so they must never be treated as user-invented names:
+/// that mislabels them in the UI and lets them be "removed".
+/// Whether `modelRoles.<role>` already holds a non-empty selector.
+fn model_role_is_set(root: &YamlValue, role: &str) -> bool {
+    string_map(match root {
+        YamlValue::Mapping(map) => map.get(YamlValue::String("modelRoles".to_string())),
+        _ => None,
+    })
+    .get(role)
+    .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn is_system_role(role: &str) -> bool {
+    SYSTEM_MODEL_ROLES.contains(&role) || KIND_MODEL_ROLES.contains(&role)
+}
+
 fn valid_custom_role(role: &str) -> bool {
     let mut characters = role.chars();
     matches!(characters.next(), Some(first) if first.is_ascii_lowercase())
@@ -276,7 +306,7 @@ fn valid_custom_role(role: &str) -> bool {
                 || character.is_ascii_digit()
                 || matches!(character, '-' | '_')
         })
-        && !SYSTEM_MODEL_ROLES.contains(&role)
+        && !is_system_role(role)
 }
 
 fn first_model_selector(value: &YamlValue) -> Option<String> {
@@ -1340,6 +1370,7 @@ fn model_from_parts(
         context_window,
         max_tokens,
         cost,
+        kind: String::new(),
     })
 }
 
@@ -1676,7 +1707,7 @@ fn apply_pi_model_capabilities(
     config.insert("thinkingLevelMap".to_string(), JsonValue::Object(level_map));
 }
 
-fn parse_models_json(content: &str) -> Result<Vec<ModelOption>, String> {
+fn parse_models_json(content: &str, read_kind: bool) -> Result<Vec<ModelOption>, String> {
     let document: JsonValue = serde_json::from_str(content)
         .map_err(|error| format!("OMP 模型列表不是有效 JSON: {error}"))?;
     let Some(models) = document.get("models").and_then(JsonValue::as_array) else {
@@ -1752,6 +1783,11 @@ fn parse_models_json(content: &str) -> Result<Vec<ModelOption>, String> {
             // no selector field, so retain the provider/id fallback.
             if !selector.is_empty() {
                 model.selector = selector;
+            }
+            // Only the `--kind all` payload carries `kind`; the chat list omits it.
+            if read_kind {
+                let value = json_string(object, "kind");
+                model.kind = if value.is_empty() { "chat".to_string() } else { value };
             }
             result.push(model);
         }
@@ -1868,7 +1904,7 @@ fn load_omp_models(custom_path: Option<&str>) -> Result<(Vec<ModelOption>, PathB
             failure_reasons.push(format!("{}: 进程退出码 {status_code}", candidate.display()));
             continue;
         }
-        let models = parse_models_json(&String::from_utf8_lossy(&output.stdout))?;
+        let models = parse_models_json(&String::from_utf8_lossy(&output.stdout), false)?;
         return Ok((models, candidate.clone()));
     }
 
@@ -1883,6 +1919,129 @@ fn load_omp_models(custom_path: Option<&str>) -> Result<(Vec<ModelOption>, PathB
             failure_reasons.join("\n")
         ))
     }
+}
+
+/// The non-chat candidate pool for the kind roles. `omp models --json` only
+/// returns chat rows and carries no `kind`, so this pass is both the metadata
+/// source and the source of image/search/tts/stt/judge candidates. Chat roles
+/// keep using the plain chat list.
+fn load_omp_kind_models(custom_path: Option<&str>) -> Vec<ModelOption> {
+    for candidate in executable_candidates(custom_path) {
+        let mut command = Command::new(&candidate);
+        command
+            .args(["models", "--kind", "all", "--json"])
+            .env("NO_COLOR", "1");
+        command.env("PATH", build_subprocess_path(candidate.parent()));
+        let Ok(output) = command.output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        if let Ok(models) = parse_models_json(&String::from_utf8_lossy(&output.stdout), true) {
+            return models;
+        }
+    }
+    Vec::new()
+}
+
+/// `provider/id` -> kind, for save-time role validation.
+fn kind_index(models: &[ModelOption]) -> HashMap<String, String> {
+    models
+        .iter()
+        .filter(|model| !model.kind.is_empty())
+        .map(|model| (model.selector.clone(), model.kind.clone()))
+        .collect()
+}
+
+/// Rows usable by at least one kind role, so the UI can offer a real candidate
+/// for `image` / `speech` / `dictation` / `judge` instead of nothing. `web` is
+/// deliberately excluded: a grounded chat model is indistinguishable from an
+/// ungrounded one in this payload, so listing all chat rows would be noise.
+fn kind_role_candidates(models: &[ModelOption]) -> Vec<ModelOption> {
+    models
+        .iter()
+        .filter(|model| {
+            KIND_MODEL_ROLES
+                .iter()
+                .filter(|role| **role != "web")
+                .any(|role| accepts_kind_role(role, &model.kind) == Some(true))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether a catalog entry satisfies a non-chat role, mirroring
+/// `MODEL_ROLES[...].accepts` in oh-my-pi's model-roles.ts.
+///
+/// `None` means "not judgeable" and must never be treated as a rejection. That
+/// covers two cases: the metadata pass was unavailable (empty `kind`), and the
+/// `web` role's chat branch — OMP accepts a chat model carrying a `webSearch`
+/// grounding, but `omp models --json` emits no such field, so a grounded chat
+/// model cannot be told apart from an ungrounded one.
+fn accepts_kind_role(role: &str, kind: &str) -> Option<bool> {
+    if kind.is_empty() {
+        return None;
+    }
+    Some(match role {
+        "image" => kind == "image",
+        "speech" => kind == "tts",
+        "dictation" => kind == "stt",
+        "judge" => matches!(kind, "judge" | "tiny" | "chat"),
+        "web" => match kind {
+            "search" => true,
+            "chat" => return None,
+            _ => false,
+        },
+        _ => return None,
+    })
+}
+
+/// Human-readable requirement shown when a kind role is assigned an
+/// incompatible model.
+fn kind_role_expectation(role: &str) -> &'static str {
+    match role {
+        "image" => "image",
+        "speech" => "tts",
+        "dictation" => "stt",
+        "judge" => "judge / tiny / chat",
+        "web" => "search（或带 webSearch grounding 的 chat）",
+        _ => "对应 kind",
+    }
+}
+
+/// `provider/id` with a leading `@role` alias and any `:effort` suffix removed.
+fn selector_base(selector: &str) -> &str {
+    let trimmed = selector.trim();
+    let without_alias = trimmed.strip_prefix('@').unwrap_or(trimmed);
+    without_alias.split(':').next().unwrap_or(without_alias)
+}
+
+/// Reject a kind-role selector that cannot satisfy the role. An unknown model is
+/// left alone: OMP reports that separately as "unknown model", and a selector
+/// that is not in the catalog yet must not be blocked here.
+fn validate_kind_role_selector(
+    role: &str,
+    selector: &str,
+    kind_index: &HashMap<String, String>,
+) -> Result<(), String> {
+    let Some(kind) = kind_index.get(selector_base(selector)) else {
+        return Ok(());
+    };
+    match accepts_kind_role(role, kind) {
+        Some(true) | None => Ok(()),
+        Some(false) => Err(format!(
+            "Role “{role}”只能使用 kind 为 {} 的模型，但 “{selector}” 的 kind 是 “{kind}”。\
+             \n非 chat kind 无法在 models.yml 中自定义（见 oh-my-pi#13272），请改选内建目录中的模型，\
+             \n或清空该 Role 以使用内建优先级链。",
+            kind_role_expectation(role)
+        )),
+    }
+}
+
+/// True when a configured `image` Role is dead because its tool is gated off.
+fn image_role_blocked_by_tool_gate(image_selector: Option<&str>, tool_enabled: Option<bool>) -> bool {
+    image_selector.is_some_and(|selector| !selector.trim().is_empty()) && tool_enabled != Some(true)
 }
 
 fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapshot, String> {
@@ -1910,13 +2069,39 @@ fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapsh
 
     let mut warnings = Vec::new();
     let agent_files = load_agent_files(&agent, &mut warnings);
-    let (models, model_executable) = load_omp_models(custom_omp_path)?;
+    let (mut models, model_executable) = load_omp_models(custom_omp_path)?;
+    // The chat list carries no `kind` of its own, so enrich it from the
+    // `--kind all` pass and derive the kind-role candidate pool from the same rows.
+    let kind_models = load_omp_kind_models(custom_omp_path);
+    let kinds = kind_index(&kind_models);
+    for model in &mut models {
+        if let Some(kind) = kinds.get(&model.selector) {
+            model.kind = kind.clone();
+        }
+    }
+    let kind_models = kind_role_candidates(&kind_models);
+
+    // The `image` role is inert while its tool is gated off: OMP registers
+    // `generate_image` only when `generate_image.enabled` is true, and it
+    // defaults to false. Surface that instead of leaving a configured-but-dead
+    // role that looks complete in this UI.
+    if image_role_blocked_by_tool_gate(
+        model_roles.get("image").map(String::as_str),
+        optional_bool(&root, &["generate_image", "enabled"]),
+    ) {
+        warnings.push(
+            "已配置 image Role，但 generate_image 工具未启用（generate_image.enabled 默认 false），\
+             \n该 Role 目前不会生效。请在 config.yml 中加入 generate_image.enabled: true。"
+                .to_string(),
+        );
+    }
 
     Ok(ConfigSnapshot {
         config_path: display_path(&config),
         config_exists,
         model_roles,
         agent_model_overrides,
+        kind_models,
         models,
         model_source: format!("{} · omp models --json", display_path(&model_executable)),
         agent_files,
@@ -2890,12 +3075,12 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
 
     for (role, selector) in &request.model_roles {
         let role = role.trim();
-        if !SYSTEM_MODEL_ROLES.contains(&role) && !valid_custom_role(role) {
+        if !is_system_role(&role) && !valid_custom_role(role) {
             return Err(format!(
                 "自定义 Role “{role}”无效：仅允许小写字母开头及小写字母、数字、-、_，且不能覆盖 OMP 系统 Role"
             ));
         }
-        if !SYSTEM_MODEL_ROLES.contains(&role) && selector.trim().is_empty() {
+        if !is_system_role(&role) && selector.trim().is_empty() {
             return Err(format!("自定义 Role “{role}”尚未选择模型"));
         }
     }
@@ -2910,6 +3095,39 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
         }
         if !removed_roles.insert(role) {
             return Err(format!("待删除的自定义 Role “{role}”重复"));
+        }
+    }
+
+    // Kind roles resolve against the catalog `kind`, not the chat pool. A
+    // mismatch here is what produced an `image` role pointing at a chat model
+    // that could never satisfy it, so refuse it at save time instead.
+    let touches_kind_role = request
+        .model_roles
+        .keys()
+        .chain(
+            request
+                .routing_settings
+                .retry_fallback_chains
+                .iter()
+                .map(|chain| &chain.target),
+        )
+        .any(|role| KIND_MODEL_ROLES.contains(&role.trim()));
+    if touches_kind_role {
+        let kinds = kind_index(&load_omp_kind_models(request.omp_path.as_deref()));
+        for (role, selector) in &request.model_roles {
+            let role = role.trim();
+            if KIND_MODEL_ROLES.contains(&role) {
+                validate_kind_role_selector(role, selector, &kinds)?;
+            }
+        }
+        for chain in &request.routing_settings.retry_fallback_chains {
+            let role = chain.target.trim();
+            if !KIND_MODEL_ROLES.contains(&role) {
+                continue;
+            }
+            for selector in &chain.selectors {
+                validate_kind_role_selector(role, selector, &kinds)?;
+            }
         }
     }
 
@@ -2962,6 +3180,12 @@ fn save_snapshot(request: SaveRequest) -> Result<ConfigSnapshot, String> {
         set_nested_value(&mut root, &["modelRoles", role.trim()], None);
     }
     for (role, selector) in &request.model_roles {
+        // An empty selector on a role the user never configured means "unset",
+        // not "clear": writing it would inject `role: ""` keys into a config the
+        // user curates by hand. Clearing an existing key still writes through.
+        if selector.is_empty() && !model_role_is_set(&root, role.trim()) {
+            continue;
+        }
         set_nested_string(&mut root, &["modelRoles", role.trim()], selector);
     }
     for (agent_name, selector) in &request.agent_model_overrides {
@@ -3727,6 +3951,7 @@ mod tests {
     fn model_catalog_parser_keeps_limits_and_pricing() {
         let models = parse_models_json(
             r#"{"models":[{"provider":"openai-codex","id":"gpt-6-astra","selector":"openai-codex/gpt-6-astra","name":"GPT-6-Astra","reasoning":true,"thinking":["low","medium","high","xhigh","max"],"input":["text","image"],"contextWindow":272000,"maxTokens":128000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}"#,
+            false,
         )
         .expect("model catalog should parse");
 
@@ -3787,6 +4012,165 @@ mod tests {
     fn custom_omp_path_takes_precedence_in_candidates() {
         let candidates = executable_candidates(Some("/opt/custom/omp"));
         assert_eq!(candidates.first(), Some(&PathBuf::from("/opt/custom/omp")));
+    }
+
+    #[test]
+    fn accepts_kind_role_matches_omp_role_definitions() {
+        assert_eq!(accepts_kind_role("image", "image"), Some(true));
+        assert_eq!(accepts_kind_role("image", "chat"), Some(false));
+        assert_eq!(accepts_kind_role("speech", "tts"), Some(true));
+        assert_eq!(accepts_kind_role("speech", "chat"), Some(false));
+        assert_eq!(accepts_kind_role("dictation", "stt"), Some(true));
+        assert_eq!(accepts_kind_role("judge", "judge"), Some(true));
+        assert_eq!(accepts_kind_role("judge", "tiny"), Some(true));
+        assert_eq!(accepts_kind_role("judge", "chat"), Some(true));
+        assert_eq!(accepts_kind_role("judge", "image"), Some(false));
+        assert_eq!(accepts_kind_role("web", "search"), Some(true));
+        assert_eq!(accepts_kind_role("web", "image"), Some(false));
+        // An empty kind means the `--kind all` metadata pass failed, so the role
+        // must not be judged. Skipping beats rejecting a config that is valid.
+        assert_eq!(accepts_kind_role("image", ""), None);
+        // `omp models --json` emits no `webSearch` field, so a chat model's
+        // grounding is unknowable here and must never be reported as a mismatch.
+        assert_eq!(accepts_kind_role("web", "chat"), None);
+        assert_eq!(accepts_kind_role("default", "chat"), None);
+    }
+
+    #[test]
+    fn selector_base_strips_alias_and_thinking_suffix() {
+        assert_eq!(selector_base("vps2/gpt-6-sol:high"), "vps2/gpt-6-sol");
+        // An alias resolves through modelRoles, not the kind index, so stripping
+        // it leaves a selector that simply won't be found and validation skips.
+        assert_eq!(selector_base("  @slow "), "slow");
+        assert_eq!(selector_base("vps2-image/gpt-image-2.5"), "vps2-image/gpt-image-2.5");
+    }
+
+    #[test]
+    fn kind_role_validation_rejects_chat_model_for_image_role() {
+        let mut index = HashMap::new();
+        index.insert("vps2/gpt-image-2.5".to_string(), "chat".to_string());
+        index.insert("vps2-image/gpt-image-2.5".to_string(), "image".to_string());
+        let error = validate_kind_role_selector("image", "vps2/gpt-image-2.5", &index)
+            .expect_err("a chat model cannot satisfy the image role");
+        assert!(error.contains("image"), "{error}");
+        assert!(error.contains("chat"), "{error}");
+        validate_kind_role_selector("image", "vps2-image/gpt-image-2.5", &index)
+            .expect("a kind=image model satisfies the image role");
+        // Unknown models are left to OMP's own "unknown model" warning.
+        validate_kind_role_selector("image", "vps2/does-not-exist", &index)
+            .expect("unknown model must not be blocked here");
+        // An empty index means metadata was unavailable; nothing is rejected.
+        validate_kind_role_selector("image", "vps2/gpt-image-2.5", &HashMap::new())
+            .expect("no metadata must not block a save");
+    }
+
+    #[test]
+    fn kind_roles_are_system_roles_not_custom_names() {
+        for role in ["default", "smol", "image", "web", "speech", "dictation", "judge"] {
+            assert!(is_system_role(role), "{role} should be a system role");
+            assert!(
+                !valid_custom_role(role),
+                "{role} must not be classified as a user-invented custom role"
+            );
+        }
+        assert!(is_system_role("designer"));
+        assert!(!is_system_role("tester"));
+        assert!(valid_custom_role("tester"));
+    }
+
+    #[test]
+    fn image_role_warns_only_when_its_tool_is_gated_off() {
+        // Configured role + tool off (the default) => dead config, warn.
+        assert!(image_role_blocked_by_tool_gate(Some("vps2-image/gpt-image-2.5"), None));
+        assert!(image_role_blocked_by_tool_gate(
+            Some("vps2-image/gpt-image-2.5"),
+            Some(false)
+        ));
+        // Tool explicitly on => working config, stay quiet.
+        assert!(!image_role_blocked_by_tool_gate(
+            Some("vps2-image/gpt-image-2.5"),
+            Some(true)
+        ));
+        // No role configured => nothing to warn about either way.
+        assert!(!image_role_blocked_by_tool_gate(None, None));
+        assert!(!image_role_blocked_by_tool_gate(Some(""), None));
+        assert!(!image_role_blocked_by_tool_gate(Some("   "), Some(false)));
+    }
+
+    #[test]
+    fn snapshot_enriches_kind_and_flags_image_role_with_tool_disabled() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let agent = home.join(".omp").join("agent");
+        fs::create_dir_all(&agent).expect("agent directory should be created");
+        fs::write(
+            agent.join("config.yml"),
+            "modelRoles:\n  image: openai/chat-model\n",
+        )
+        .expect("test config should be written");
+
+        // The mock answers the chat list and the `--kind all` metadata pass
+        // separately, exactly as omp does.
+        let bin_dir = home.join(".bun").join("bin");
+        fs::create_dir_all(&bin_dir).expect("mock bin directory should be created");
+        let mock_omp = bin_dir.join("omp");
+        fs::write(
+            &mock_omp,
+            // The chat list carries no `kind` and no image rows; only the
+            // `--kind all` pass does. If enrichment regressed, chat.kind would
+            // stay empty and this test fails.
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "all" ]; then
+    echo '{"models":[{"provider":"openai","id":"chat-model","kind":"chat"},{"provider":"openai","id":"img","kind":"image"}]}'
+    exit 0
+  fi
+done
+echo '{"models":[{"provider":"openai","id":"chat-model"}]}'
+"#,
+        )
+        .expect("mock omp script should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&mock_omp).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&mock_omp, permissions).expect("chmod");
+        }
+
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+        let snapshot = load_snapshot_from_disk(Some(&mock_omp.to_string_lossy()));
+        if let Some(previous) = previous_home {
+            env::set_var("HOME", previous);
+        }
+
+        let snapshot = snapshot.expect("snapshot should load");
+        let chat = snapshot
+            .models
+            .iter()
+            .find(|model| model.selector == "openai/chat-model")
+            .expect("chat model should be present");
+        assert_eq!(chat.kind, "chat", "kind must be enriched from --kind all");
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("generate_image.enabled")),
+            "expected a tool-gate warning, got {:?}",
+            snapshot.warnings
+        );
+        // A: the kind-role pool comes from the `--kind all` pass. `openai/img`
+        // is the proof — the chat list never carried it. `openai/chat-model` is
+        // present too, and correctly so: OMP's `judge` role accepts chat models.
+        let candidates: Vec<&str> = snapshot
+            .kind_models
+            .iter()
+            .map(|model| model.selector.as_str())
+            .collect();
+        assert_eq!(candidates, vec!["openai/chat-model", "openai/img"]);
     }
 
     #[test]
@@ -4337,5 +4721,225 @@ mod tests {
             env::remove_var("HOME");
         }
         fs::remove_dir_all(home).expect("isolated test home should be removed");
+    }
+    /// Install a mock `omp` that reports one chat row and one kind=image row.
+    fn install_kind_role_mock(home: &Path) -> PathBuf {
+        let agent = home.join(".omp").join("agent");
+        fs::create_dir_all(&agent).expect("agent directory should be created");
+        fs::write(
+            agent.join("config.yml"),
+            "modelRoles:\n  default: openai/chat-model\n",
+        )
+        .expect("test config should be written");
+        let bin_dir = home.join(".bun").join("bin");
+        fs::create_dir_all(&bin_dir).expect("mock bin directory should be created");
+        let mock_omp = bin_dir.join("omp");
+        fs::write(
+            &mock_omp,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "all" ]; then
+    echo '{"models":[{"provider":"openai","id":"chat-model","kind":"chat"},{"provider":"openai","id":"img","kind":"image"}]}'
+    exit 0
+  fi
+done
+echo '{"models":[{"provider":"openai","id":"chat-model"}]}'
+"#,
+        )
+        .expect("mock omp script should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&mock_omp).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&mock_omp, permissions).expect("chmod");
+        }
+        mock_omp
+    }
+
+    fn empty_routing_settings() -> RoutingSettings {
+        RoutingSettings {
+            default_thinking_level: None,
+            auto_thinking_max_effort: None,
+            advisor_enabled: None,
+            advisor_sync_backlog: None,
+            advisor_immune_turns: None,
+            prewalk_enabled: None,
+            retry_model_fallback: None,
+            retry_fallback_chains: Vec::new(),
+            retry_fallback_revert_policy: None,
+        }
+    }
+
+    #[test]
+    fn save_refuses_an_image_role_pointed_at_a_chat_model() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let mock_omp = install_kind_role_mock(&home);
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+
+        let result = save_snapshot(SaveRequest {
+            model_roles: BTreeMap::from([("image".to_string(), "openai/chat-model".to_string())]),
+            removed_model_roles: Vec::new(),
+            agent_model_overrides: BTreeMap::new(),
+            agent_files: Vec::new(),
+            routing_settings: empty_routing_settings(),
+            omp_path: Some(mock_omp.to_string_lossy().into_owned()),
+        });
+
+        if let Some(previous) = previous_home {
+            env::set_var("HOME", previous);
+        }
+        fs::remove_dir_all(home).ok();
+
+        let error = result.expect_err("a chat model cannot be saved as the image role");
+        assert!(error.contains("image"), "{error}");
+        assert!(
+            error.contains("oh-my-pi#13272"),
+            "the error should point at the upstream limitation: {error}"
+        );
+    }
+
+    #[test]
+    fn save_accepts_an_image_role_pointed_at_an_image_model() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let mock_omp = install_kind_role_mock(&home);
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+
+        let result = save_snapshot(SaveRequest {
+            model_roles: BTreeMap::from([("image".to_string(), "openai/img".to_string())]),
+            removed_model_roles: Vec::new(),
+            agent_model_overrides: BTreeMap::new(),
+            agent_files: Vec::new(),
+            routing_settings: empty_routing_settings(),
+            omp_path: Some(mock_omp.to_string_lossy().into_owned()),
+        });
+
+        let saved = result.expect("a kind=image model must be accepted");
+        assert_eq!(saved.model_roles.get("image").map(String::as_str), Some("openai/img"));
+
+        if let Some(previous) = previous_home {
+            env::set_var("HOME", previous);
+        }
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn save_does_not_inject_empty_keys_for_unconfigured_kind_roles() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let mock_omp = install_kind_role_mock(&home);
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+
+        // The frontend always submits every system role; the untouched ones
+        // arrive as "". Those must not appear in a hand-curated config.yml.
+        let result = save_snapshot(SaveRequest {
+            model_roles: BTreeMap::from([
+                ("image".to_string(), "openai/img".to_string()),
+                ("speech".to_string(), String::new()),
+                ("dictation".to_string(), String::new()),
+                ("judge".to_string(), String::new()),
+            ]),
+            removed_model_roles: Vec::new(),
+            agent_model_overrides: BTreeMap::new(),
+            agent_files: Vec::new(),
+            routing_settings: empty_routing_settings(),
+            omp_path: Some(mock_omp.to_string_lossy().into_owned()),
+        });
+        let saved = result.expect("save should succeed");
+        let parsed: YamlValue = serde_yaml::from_str(
+            &fs::read_to_string(home.join(".omp").join("agent").join("config.yml"))
+                .expect("config should be readable"),
+        )
+        .expect("config should parse");
+        let roles = nested_string_map(&parsed, &["modelRoles"]);
+
+        assert_eq!(roles.get("image").map(String::as_str), Some("openai/img"));
+        for role in ["speech", "dictation", "judge"] {
+            assert!(
+                !roles.contains_key(role),
+                "unset {role} must not be written into config.yml, got {roles:?}"
+            );
+        }
+        assert_eq!(saved.model_roles.get("image").map(String::as_str), Some("openai/img"));
+
+        if let Some(previous) = previous_home {
+            env::set_var("HOME", previous);
+        }
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn save_still_clears_an_existing_role_left_empty() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let mock_omp = install_kind_role_mock(&home);
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+
+        // `default` exists in the fixture config, so emptying it must clear it
+        // rather than be skipped as "never configured".
+        save_snapshot(SaveRequest {
+            model_roles: BTreeMap::from([("default".to_string(), String::new())]),
+            removed_model_roles: Vec::new(),
+            agent_model_overrides: BTreeMap::new(),
+            agent_files: Vec::new(),
+            routing_settings: empty_routing_settings(),
+            omp_path: Some(mock_omp.to_string_lossy().into_owned()),
+        })
+        .expect("save should succeed");
+
+        let content =
+            fs::read_to_string(home.join(".omp").join("agent").join("config.yml")).expect("readable");
+        let parsed: YamlValue = serde_yaml::from_str(&content).expect("config should parse");
+        assert!(
+            !model_role_is_set(&parsed, "default"),
+            "an existing role cleared to empty must be written through, got {content}"
+        );
+
+        if let Some(previous) = previous_home {
+            env::set_var("HOME", previous);
+        }
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn kind_roles_cannot_be_removed_as_custom_roles() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let mock_omp = install_kind_role_mock(&home);
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+
+        let result = save_snapshot(SaveRequest {
+            model_roles: BTreeMap::new(),
+            removed_model_roles: vec!["image".to_string()],
+            agent_model_overrides: BTreeMap::new(),
+            agent_files: Vec::new(),
+            routing_settings: empty_routing_settings(),
+            omp_path: Some(mock_omp.to_string_lossy().into_owned()),
+        });
+
+        if let Some(previous) = previous_home {
+            env::set_var("HOME", previous);
+        }
+        fs::remove_dir_all(home).ok();
+
+        let error = result.expect_err("a built-in kind role is not a deletable custom role");
+        assert!(error.contains("image"), "{error}");
     }
 }

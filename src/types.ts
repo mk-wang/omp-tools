@@ -16,6 +16,8 @@ export type ModelOption = {
   contextWindow: number | null;
   maxTokens: number | null;
   cost: ModelCost | null;
+  /** Catalog kind from `omp models --kind all`; "" when that pass is unavailable. */
+  kind: string;
 };
 
 export type CustomProviderModel = {
@@ -99,6 +101,8 @@ export type ConfigSnapshot = {
   modelRoles: Record<string, string>;
   agentModelOverrides: Record<string, string>;
   models: ModelOption[];
+  /** Candidates for the non-chat kind roles, from `omp models --kind all`. */
+  kindModels: ModelOption[];
   modelSource: string;
   agentFiles: AgentDefinitionFile[];
   routingSettings: RoutingSettings;
