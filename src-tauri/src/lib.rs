@@ -1635,6 +1635,17 @@ fn model_effort_levels(model: &CustomProviderSaveModel) -> Vec<String> {
 }
 
 fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSaveModel) {
+    config.insert(
+        YamlValue::String("input".to_string()),
+        YamlValue::Sequence(vec![
+            YamlValue::String("text".to_string()),
+            YamlValue::String("image".to_string()),
+        ]),
+    );
+    config.insert(
+        YamlValue::String("reasoning".to_string()),
+        YamlValue::Bool(true),
+    );
     if !supports_effort_model_metadata(model.api.trim()) {
         return;
     }
@@ -1642,10 +1653,6 @@ fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSave
     if efforts.is_empty() {
         return;
     }
-    config.insert(
-        YamlValue::String("reasoning".to_string()),
-        YamlValue::Bool(true),
-    );
     let mut thinking = config
         .get(YamlValue::String("thinking".to_string()))
         .and_then(YamlValue::as_mapping)
@@ -3498,7 +3505,7 @@ mod tests {
         fs::write(agent.join("config.yml"), config_content).expect("test config should be written");
         fs::write(
             agent.join("models.yml"),
-            "providers:\n  gateway:\n    baseUrl: https://old.example.com/v1\n    api: openai-completions\n    apiKey: OLD_KEY\n    headers:\n      X-Team: keep\n    models:\n      - id: keep\n        name: Keep model\n        contextWindow: 123\n        compat:\n          supportsStore: true\n      - id: drop\n        name: Drop model\n  discovery-only:\n    baseUrl: https://discovery.example.com/v1\n    api: openai-completions\n    apiKey: DISCOVERY_KEY\n    discovery:\n      type: openai-models-list\n",
+            "providers:\n  gateway:\n    baseUrl: https://old.example.com/v1\n    api: openai-completions\n    apiKey: OLD_KEY\n    headers:\n      X-Team: keep\n    models:\n      - id: keep\n        name: Keep model\n        input: [text]\n        reasoning: false\n        contextWindow: 123\n        compat:\n          supportsStore: true\n      - id: drop\n        name: Drop model\n  discovery-only:\n    baseUrl: https://discovery.example.com/v1\n    api: openai-completions\n    apiKey: DISCOVERY_KEY\n    discovery:\n      type: openai-models-list\n",
         )
         .expect("test models.yml should be written");
 
@@ -3573,6 +3580,19 @@ mod tests {
         let providers = nested_value(&written, &["providers"])
             .and_then(YamlValue::as_mapping)
             .expect("providers mapping should exist");
+        let expected_input = YamlValue::Sequence(vec![
+            YamlValue::String("text".to_string()),
+            YamlValue::String("image".to_string()),
+        ]);
+        for provider_id in ["gateway", "added"] {
+            for model in written["providers"][provider_id]["models"]
+                .as_sequence()
+                .expect("saved provider models should exist")
+            {
+                assert_eq!(model["input"], expected_input);
+                assert_eq!(model["reasoning"], YamlValue::Bool(true));
+            }
+        }
         let gateway_config = providers
             .get(YamlValue::String("gateway".to_string()))
             .and_then(YamlValue::as_mapping)

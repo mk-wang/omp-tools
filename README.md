@@ -115,7 +115,7 @@ Run the release verification workflow and report concrete findings.
 ## 配置写入与数据边界
 
 - 后端只更新受管理的 YAML 映射：`config.yml` 中的 `modelRoles`、`task.agentModelOverrides`、thinking/Advisor/Prewalk 设置和 `retry.fallbackChains`；`disabledProviders` 不属于本工具的 OMP shadow 状态，Apply 会保留其现有值；其余未识别的 config 键也会保留。
-- `models.yml` 中只 upsert 当前 custom provider 明确管理的 `baseUrl`、`apiKey` 和勾选的 `models`；每个保存的 model 都带自己的 `api`，托管 provider 不再写 provider-level `api`。OpenAI Completions/Responses model 保存时默认写入 `compat.promptCacheSessionHeader: X-Session-Id`；已有 model 元数据、compat 字段及 provider headers 等未管理字段保留。只有用户明确删除的 provider 才会移除；override-only/discovery provider 不会被编辑器接管。
+- `models.yml` 中只 upsert 当前 custom provider 明确管理的 `baseUrl`、`apiKey` 和勾选的 `models`；每个保存的 model 都带自己的 `api`，并统一写入 `input: [text, image]` 和 `reasoning: true`，包括覆盖已有的这两个字段。托管 provider 不再写 provider-level `api`。OpenAI Completions/Responses model 保存时默认写入 `compat.promptCacheSessionHeader: X-Session-Id`；其余已有 model 元数据、compat 字段及 provider headers 等未管理字段保留。只有用户明确删除的 provider 才会移除；override-only/discovery provider 不会被编辑器接管。Pi 的 `models.json` 不使用这两个统一默认值。
 - Provider shadow 状态是 WebView 本地草稿：只针对当前 `omp models --json` 返回的 provider 生效，不从 `disabledProviders` 载入，也不会写回该字段；预设可以保存这份本地 shadow 状态。
 - Custom provider 的 API key 只会由 **保存 Provider** 写入本机 `models.yml`；读取已有配置时只返回“已配置”状态，不把密钥返回到 WebView。
 - YAML 会经过 `serde_yaml` 重新序列化，因此格式和注释可能被重写；如需保留原始格式，请在写入前备份文件。
