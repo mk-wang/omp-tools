@@ -96,7 +96,7 @@ omp models --json
 - 自定义 Role 必须选择模型。
 - Agent Markdown 必须包含 `name`、`description`、`model` 三个 frontmatter 字段，并包含非空正文。
 - shadowed provider 不能继续被模型 Role、Agent 或 Agent override 使用。
-- 已配置但不在当前 `omp models --json` 返回列表中的直接模型 selector 会被标记为非法。
+- Chat Role 和 Agent 的直接模型 selector 按 `omp models --json` 校验；kind Role 及其 fallback 按 `omp models --kind all --json` 的候选池校验，包括 `web` 使用的 search 模型（如 `web/exa`）。
 - Fallback target 必须唯一且至少有一个候选；候选不能留空、重复、回退到自身或继续使用 shadowed provider。
 - 空白的全局策略控件表示继承 OMP 默认，不会强行写入一个覆盖值。
 

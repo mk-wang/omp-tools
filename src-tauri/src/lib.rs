@@ -1961,17 +1961,15 @@ fn kind_index(models: &[ModelOption]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Rows usable by at least one kind role, so the UI can offer a real candidate
-/// for `image` / `speech` / `dictation` / `judge` instead of nothing. `web` is
-/// deliberately excluded: a grounded chat model is indistinguishable from an
-/// ungrounded one in this payload, so listing all chat rows would be noise.
+/// Rows usable by at least one kind role, including `web` search candidates.
+/// Grounded chat models already enter through `judge`; the CLI does not expose
+/// enough metadata to distinguish their web-search capability.
 fn kind_role_candidates(models: &[ModelOption]) -> Vec<ModelOption> {
     models
         .iter()
         .filter(|model| {
             KIND_MODEL_ROLES
                 .iter()
-                .filter(|role| **role != "web")
                 .any(|role| accepts_kind_role(role, &model.kind) == Some(true))
         })
         .cloned()
@@ -4144,7 +4142,7 @@ mod tests {
             r#"#!/bin/sh
 for arg in "$@"; do
   if [ "$arg" = "all" ]; then
-    echo '{"models":[{"provider":"openai","id":"chat-model","kind":"chat"},{"provider":"openai","id":"img","kind":"image"}]}'
+    echo '{"models":[{"provider":"openai","id":"chat-model","kind":"chat"},{"provider":"openai","id":"img","kind":"image"},{"provider":"web","id":"exa","kind":"search"},{"provider":"openai","id":"embedding","kind":"embedding"}]}'
     exit 0
   fi
 done
@@ -4182,15 +4180,17 @@ echo '{"models":[{"provider":"openai","id":"chat-model"}]}'
             "expected a tool-gate warning, got {:?}",
             snapshot.warnings
         );
-        // A: the kind-role pool comes from the `--kind all` pass. `openai/img`
-        // is the proof — the chat list never carried it. `openai/chat-model` is
-        // present too, and correctly so: OMP's `judge` role accepts chat models.
+        // Kind-role validation must retain search models absent from the chat
+        // catalog, without admitting kinds that no managed role accepts.
         let candidates: Vec<&str> = snapshot
             .kind_models
             .iter()
             .map(|model| model.selector.as_str())
             .collect();
-        assert_eq!(candidates, vec!["openai/chat-model", "openai/img"]);
+        assert!(candidates.contains(&"openai/chat-model"));
+        assert!(candidates.contains(&"openai/img"));
+        assert!(candidates.contains(&"web/exa"), "web fallback must be selectable");
+        assert!(!candidates.contains(&"openai/embedding"));
     }
 
     #[test]
