@@ -10,7 +10,9 @@ import {
   CUSTOM_PROVIDER_PATTERN,
   CustomProviderModal,
   customProviderApiOverrides,
+  customProviderApiOverride,
   inferredCustomProviderApi,
+  mergeDiscoveredModels,
   PI_CUSTOM_PROVIDER_API_OPTIONS,
   sortedCustomProviderModels,
   type CustomProviderEditor
@@ -107,12 +109,6 @@ function preferredThinkingForModel(
     : options.includes("medium")
       ? "medium"
       : options[0] ?? "off";
-}
-
-function modelIdForProviderSelector(value: string, provider: string): string {
-  const base = baseModelOf(value).trim();
-  const prefix = `${provider}/`;
-  return base.startsWith(prefix) ? base.slice(prefix.length) : "";
 }
 
 function PiModelSelect({
@@ -606,17 +602,27 @@ export default function PiPanel({
         ) {
           return current;
         }
+        const configured = current.mode === "edit"
+          ? customProviders.find(provider => provider.id === current.originalId)
+          : undefined;
+        // Configured leaves seed the merge only while the editor still targets the same endpoint and Type.
+        const configuredModels = configured
+          && configured.baseUrl.trim() === current.baseUrl.trim()
+          && current.api === inferredCustomProviderApi(configured.api, configured.models, PI_CUSTOM_PROVIDER_API_OPTIONS[0].value)
+          ? configured.models
+          : [];
+        const mergedModels = mergeDiscoveredModels([...configuredModels, ...current.availableModels], models);
         const modelApiOverrides = { ...current.modelApiOverrides };
-        models.forEach(model => {
+        mergedModels.forEach(model => {
           if (model.api && model.api !== current.api && !Object.hasOwn(modelApiOverrides, model.id)) {
-            modelApiOverrides[model.id] = model.api;
+            Object.defineProperty(modelApiOverrides, model.id, { value: model.api, enumerable: true, writable: true, configurable: true });
           }
         });
         return {
           ...current,
           modelApiOverrides,
           discoveredModelIds: models.map(model => model.id),
-          availableModels: models
+          availableModels: mergedModels
         };
       });
       if (models.length === 0) {
@@ -647,7 +653,8 @@ export default function PiPanel({
             id: model.id,
             api: model.api?.trim() || provider.api,
             thinking: model.thinking ?? [],
-            defaultThinkingLevel: model.defaultThinkingLevel ?? null
+            defaultThinkingLevel: model.defaultThinkingLevel ?? null,
+            configuration: model.configuration
           }))
         })),
         removedCustomProviders: removedProviderIds
@@ -655,16 +662,7 @@ export default function PiPanel({
       const savedProviders = await savePiCustomProviders(request);
       setCustomProviders(savedProviders);
       setSnapshot(current => current ? { ...current, customProviders: savedProviders } : current);
-      try {
-        const refreshed = await loadPiSnapshot(customPiPath || undefined);
-        setSnapshot(current => current ? {
-          ...current,
-          models: refreshed.models,
-          customProviders: savedProviders
-        } : refreshed);
-      } catch (refreshError) {
-        setError(`Provider 已保存，但重新读取模型列表失败：${readableError(refreshError)}`);
-      }
+      await load(customPiPath || undefined);
       return true;
     } catch (saveError) {
       const message = readableError(saveError);
@@ -707,7 +705,6 @@ export default function PiPanel({
     if (!customProviderEditor || customProviderSaving) return;
     const editor = customProviderEditor;
     const id = editor.id.trim();
-    const selectedModels = new Set(editor.models);
     const duplicate = editor.mode === "create" && customProviders.some(provider => provider.id === id);
     const validationError = !id
       ? "请输入 provider ID。"
@@ -720,7 +717,7 @@ export default function PiPanel({
             : !PI_CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === editor.api)
               ? "请选择 Pi 支持的 Type。"
               : editor.models.some(modelId => {
-                  const api = editor.modelApiOverrides[modelId]?.trim() || editor.api;
+                  const api = customProviderApiOverride(editor.modelApiOverrides, modelId).trim() || editor.api;
                   return !PI_CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === api);
                 })
                 ? "请选择每个 model 支持的 Type。"
@@ -734,21 +731,15 @@ export default function PiPanel({
       return;
     }
 
-    const references = Object.entries(tiers.tiers).flatMap(([tierName, tier]) => [
-      ...(providerOf(tier.model) === id && !selectedModels.has(modelIdForProviderSelector(tier.model, id))
-        ? [`Tier ${tierName} 主模型`]
-        : []),
-      ...tier.fallbackModels
-        .filter(selector => providerOf(selector) === id && !selectedModels.has(modelIdForProviderSelector(selector, id)))
-        .map(selector => `Tier ${tierName} fallback ${selector}`)
-    ]);
-    if (references.length > 0) {
-      setCustomProviderSaveError(`不能取消使用 provider “${id}”的 model；仍被 ${references.join("、")} 引用。`);
-      return;
-    }
 
     const apiKey = editor.apiKey.trim();
-    const availableById = new Map(editor.availableModels.map(model => [model.id, model]));
+    const configuredModels = editor.mode === "edit"
+      ? customProviders.find(provider => provider.id === editor.originalId)?.models ?? []
+      : [];
+    // Refreshed metadata wins; configured metadata covers selected models the refresh omitted.
+    const availableById = new Map(
+      [...configuredModels, ...editor.availableModels].map(model => [model.id, model])
+    );
     const nextProvider: CustomProvider = {
       id,
       baseUrl: editor.baseUrl.trim(),
@@ -760,7 +751,7 @@ export default function PiPanel({
           const model = availableById.get(modelId) ?? { id: modelId, name: modelId };
           return {
             ...model,
-            api: editor.modelApiOverrides[modelId]?.trim() || editor.api
+            api: customProviderApiOverride(editor.modelApiOverrides, modelId).trim() || editor.api
           };
         })
       )
@@ -776,7 +767,6 @@ export default function PiPanel({
     if (!saved) return;
     setPendingDeleteCustomProvider("");
     setCustomProviderEditor(null);
-    setError("");
   };
 
   const removeCustomProvider = async (id: string) => {
@@ -803,7 +793,6 @@ export default function PiPanel({
     if (!saved) return;
     setPendingDeleteCustomProvider("");
     setCustomProviderEditor(null);
-    setError("");
   };
 
   const openModelsFile = async () => {

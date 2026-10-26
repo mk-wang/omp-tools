@@ -1,3 +1,5 @@
+mod model_metadata;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value as YamlValue};
@@ -25,7 +27,7 @@ const SYSTEM_MODEL_ROLES: [&str; 10] = [
 /// `webSearch` grounding) rather than the chat pool. Mirrors
 /// `KIND_ROLE_IDS` in oh-my-pi's model-roles.ts.
 const KIND_MODEL_ROLES: [&str; 5] = ["image", "web", "speech", "dictation", "judge"];
-const CUSTOM_PROVIDER_APIS: [&str; 11] = [
+const CUSTOM_PROVIDER_APIS: [&str; 21] = [
     "openai-completions",
     "openai-responses",
     "openai-codex-responses",
@@ -36,7 +38,17 @@ const CUSTOM_PROVIDER_APIS: [&str; 11] = [
     "google-gemini-cli",
     "google-vertex",
     "openrouter-decisions",
+    "openai-decisions",
+    "workers-ai-systemone",
     "typesafe",
+    "openai-images",
+    "openrouter-images",
+    "xai-tts",
+    "openai-speech",
+    "openai-embeddings",
+    "openrouter-rerank",
+    "openrouter-video",
+    "openai-transcriptions",
 ];
 const PI_CUSTOM_PROVIDER_APIS: [&str; 4] = [
     "openai-completions",
@@ -85,6 +97,8 @@ struct CustomProviderModel {
     thinking: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_thinking_level: Option<String>,
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    configuration: model_metadata::Configuration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +110,8 @@ struct CustomProviderSaveModel {
     thinking: Vec<String>,
     #[serde(default)]
     default_thinking_level: Option<String>,
+    #[serde(default)]
+    configuration: model_metadata::Configuration,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -642,7 +658,9 @@ fn json_model_thinking_levels(value: &JsonValue) -> Vec<String> {
         return Vec::new();
     };
     let supported_levels = object
-        .get("supported_reasoning_levels")
+        .get("metadata")
+        .and_then(|metadata| metadata.get("supported_reasoning_levels"))
+        .or_else(|| object.get("supported_reasoning_levels"))
         .and_then(JsonValue::as_array)
         .map(|levels| {
             levels
@@ -664,7 +682,7 @@ fn json_model_thinking_levels(value: &JsonValue) -> Vec<String> {
     if let Some(levels) = object
         .get("thinking")
         .and_then(JsonValue::as_object)
-        .and_then(|thinking| thinking.get("levels"))
+        .and_then(|thinking| thinking.get("efforts").or_else(|| thinking.get("levels")))
         .and_then(JsonValue::as_array)
     {
         return normalize_custom_provider_thinking_levels(
@@ -691,9 +709,9 @@ fn json_model_thinking_levels(value: &JsonValue) -> Vec<String> {
 }
 
 fn json_model_default_thinking_level(value: &JsonValue) -> Option<String> {
-    value
-        .as_object()
-        .and_then(|object| object.get("default_reasoning_level"))
+    value.get("metadata").and_then(|metadata| metadata.get("default_reasoning_level"))
+        .or_else(|| value.get("default_reasoning_level"))
+        .or_else(|| value.get("thinking").and_then(|thinking| thinking.get("defaultLevel")))
         .and_then(JsonValue::as_str)
         .and_then(normalize_custom_provider_thinking_level)
 }
@@ -729,6 +747,7 @@ fn custom_provider_models(value: Option<&YamlValue>) -> Vec<CustomProviderModel>
                 api: yaml_model_api(value),
                 thinking: yaml_model_thinking_levels(value),
                 default_thinking_level: yaml_model_default_thinking_level(value),
+                configuration: model_metadata::snapshot(&serde_json::to_value(value).unwrap_or(JsonValue::Null)),
             })
         })
         .collect::<Vec<_>>();
@@ -808,6 +827,7 @@ fn custom_provider_models_json(value: Option<&JsonValue>) -> Vec<CustomProviderM
                 api: json_model_api(value),
                 thinking: json_model_thinking_levels(value),
                 default_thinking_level: json_model_default_thinking_level(value),
+                configuration: model_metadata::snapshot(value),
             })
         })
         .collect::<Vec<_>>();
@@ -1010,6 +1030,8 @@ fn validate_custom_provider_models(
                 "{product_label} custom provider “{provider_id}”的 model “{model_id}” Type “{api}”不受支持"
             ));
         }
+        model_metadata::validate(&model.configuration)
+            .map_err(|error| format!("{product_label} model “{model_id}”：{error}"))?;
     }
     Ok(())
 }
@@ -1045,6 +1067,21 @@ fn validate_custom_providers(
         validate_custom_provider_models(id, &provider.models, &CUSTOM_PROVIDER_APIS, "OMP")?;
 
         let existing = existing_custom_provider(root, id).and_then(YamlValue::as_mapping);
+        let existing_models = existing
+            .and_then(|config| config.get(YamlValue::String("models".to_string())))
+            .and_then(YamlValue::as_sequence);
+        for model in &provider.models {
+            let mut effective = existing_models
+                .and_then(|models| models.iter().find(|value| yaml_model_id(value).as_deref() == Some(model.id.trim())))
+                .and_then(|value| serde_json::to_value(value).ok())
+                .map(|value| model_metadata::configured(&value))
+                .unwrap_or_default();
+            model_metadata::merge(&mut effective, &model.configuration);
+            model_metadata::validate(&effective)
+                .map_err(|error| format!("OMP model “{}”：{error}", model.id.trim()))?;
+            model_metadata::validate_api(&effective, model.api.trim())
+                .map_err(|error| format!("OMP model “{}”：{error}", model.id.trim()))?;
+        }
         let existing_key = existing
             .and_then(|config| mapping_string(config, "apiKey"))
             .filter(|key| !key.trim().is_empty());
@@ -1543,6 +1580,15 @@ fn parse_custom_provider_model_list(
             continue;
         }
         let hidden = json_model_is_hidden(value);
+        let mut configuration = if hidden {
+            model_metadata::Configuration::new()
+        } else {
+            model_metadata::discover(value)
+                .map_err(|error| format!("Model “{id}”：{error}"))?
+        };
+        if !hidden && name != id && !name.is_empty() {
+            configuration.insert("name".to_string(), JsonValue::String(name.clone()));
+        }
         models.push(CustomProviderModel {
             id,
             name: if name.is_empty() {
@@ -1561,6 +1607,7 @@ fn parse_custom_provider_model_list(
             } else {
                 json_model_default_thinking_level(value)
             },
+            configuration,
         });
     }
     models.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1578,8 +1625,12 @@ fn merge_custom_provider_model_capabilities(
         let Some(rich_model) = rich_by_id.get(&model.id) else {
             continue;
         };
+        let mut configuration = rich_model.configuration.clone();
+        model_metadata::merge(&mut configuration, &model.configuration);
+        model.configuration = configuration;
         if model.name == model.id && rich_model.name != rich_model.id {
             model.name = rich_model.name.clone();
+            model.configuration.insert("name".to_string(), JsonValue::String(model.name.clone()));
         }
         if model.api.is_none() {
             model.api = rich_model.api.clone();
@@ -1635,17 +1686,14 @@ fn model_effort_levels(model: &CustomProviderSaveModel) -> Vec<String> {
 }
 
 fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSaveModel) {
-    config.insert(
-        YamlValue::String("input".to_string()),
-        YamlValue::Sequence(vec![
-            YamlValue::String("text".to_string()),
-            YamlValue::String("image".to_string()),
-        ]),
-    );
-    config.insert(
-        YamlValue::String("reasoning".to_string()),
-        YamlValue::Bool(true),
-    );
+    model_metadata::apply_yaml(config, &model.configuration);
+    if config.contains_key(YamlValue::String("thinking".to_string())) {
+        if model.configuration.contains_key("thinking") {
+            config.entry(YamlValue::String("reasoning".to_string()))
+                .or_insert(YamlValue::Bool(true));
+        }
+        return;
+    }
     if !supports_effort_model_metadata(model.api.trim()) {
         return;
     }
@@ -1653,11 +1701,9 @@ fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSave
     if efforts.is_empty() {
         return;
     }
-    let mut thinking = config
-        .get(YamlValue::String("thinking".to_string()))
-        .and_then(YamlValue::as_mapping)
-        .cloned()
-        .unwrap_or_default();
+    config.entry(YamlValue::String("reasoning".to_string()))
+        .or_insert(YamlValue::Bool(true));
+    let mut thinking = Mapping::new();
     thinking.insert(
         YamlValue::String("mode".to_string()),
         YamlValue::String("effort".to_string()),
@@ -1676,8 +1722,6 @@ fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSave
             YamlValue::String("defaultLevel".to_string()),
             YamlValue::String(default_level),
         );
-    } else {
-        thinking.remove(&YamlValue::String("defaultLevel".to_string()));
     }
     config.insert(
         YamlValue::String("thinking".to_string()),
@@ -1689,11 +1733,12 @@ fn apply_pi_model_capabilities(
     config: &mut serde_json::Map<String, JsonValue>,
     model: &CustomProviderSaveModel,
 ) {
+    model_metadata::merge(config, &model_metadata::for_pi(&model.configuration));
     let levels = normalize_custom_provider_thinking_levels(&model.thinking);
     if levels.is_empty() {
         return;
     }
-    config.insert("reasoning".to_string(), JsonValue::Bool(true));
+    config.entry("reasoning".to_string()).or_insert(JsonValue::Bool(true));
     let present = levels.iter().cloned().collect::<HashSet<_>>();
     let mut level_map = config
         .get("thinkingLevelMap")
@@ -3287,6 +3332,28 @@ mod tests {
             api: api.to_string(),
             thinking: Vec::new(),
             default_thinking_level: None,
+            configuration: model_metadata::Configuration::new(),
+        }
+    }
+
+    #[test]
+    fn custom_provider_validation_checks_retained_metadata_before_save() {
+        for (metadata, api) in [
+            ("contextWindow: huge", "openai-responses"),
+            ("contextWindow: 0", "openai-responses"),
+            ("kind: chat", "xai-tts"),
+        ] {
+            let root: YamlValue = serde_yaml::from_str(&format!(
+                "providers:\n  gateway:\n    auth: none\n    models:\n      - id: keep\n        {metadata}\n"
+            )).unwrap();
+            let provider = CustomProviderSave {
+                id: "gateway".to_string(),
+                base_url: "https://gateway.example/v1".to_string(),
+                api: api.to_string(),
+                api_key: None,
+                models: vec![saved_model("keep", api)],
+            };
+            assert!(validate_custom_providers(&root, &[provider]).is_err());
         }
     }
 
@@ -3578,19 +3645,6 @@ mod tests {
         let providers = nested_value(&written, &["providers"])
             .and_then(YamlValue::as_mapping)
             .expect("providers mapping should exist");
-        let expected_input = YamlValue::Sequence(vec![
-            YamlValue::String("text".to_string()),
-            YamlValue::String("image".to_string()),
-        ]);
-        for provider_id in ["gateway", "added"] {
-            for model in written["providers"][provider_id]["models"]
-                .as_sequence()
-                .expect("saved provider models should exist")
-            {
-                assert_eq!(model["input"], expected_input);
-                assert_eq!(model["reasoning"], YamlValue::Bool(true));
-            }
-        }
         let gateway_config = providers
             .get(YamlValue::String("gateway".to_string()))
             .and_then(YamlValue::as_mapping)
@@ -3767,6 +3821,7 @@ mod tests {
             api: "openai-responses".to_string(),
             thinking: vec!["low".to_string(), "medium".to_string(), "max".to_string()],
             default_thinking_level: Some("medium".to_string()),
+            configuration: model_metadata::Configuration::new(),
         };
         let provider = CustomProviderSave {
             id: "gateway".to_string(),
@@ -3923,10 +3978,10 @@ mod tests {
                 assert!(request.contains("authorization: bearer test-key"));
                 let body = if request_index == 0 {
                     assert!(request.contains("get /v1/models http/1.1"));
-                    r#"{"data":[{"id":"model-a","name":"model-a"},{"id":"model-b"}]}"#
+                    r#"{"data":[{"id":"model-a","name":"model-a","context_length":240000,"max_output_tokens":32000,"input":["text"],"reasoning":false,"supportsTools":false,"compat":{"supportsStore":false}},{"id":"model-b"}]}"#
                 } else {
                     assert!(request.contains("get /v1/models?client_version=0.144.1 http/1.1"));
-                    r#"{"models":[{"slug":"model-a","display_name":"Model A","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"ultra"}]}]}"#
+                    r#"{"models":[{"slug":"model-a","display_name":"Model A","contextWindow":999999,"maxContextWindow":1000000,"cost":{"input":0,"output":2,"cacheRead":0,"cacheWrite":0},"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"ultra"}]}]}"#
                 };
                 write!(
                     stream,
@@ -3949,6 +4004,22 @@ mod tests {
                 target: None,
             },
         ));
+        let result = result.and_then(|models| {
+            let request: CustomProviderSaveRequest = serde_json::from_value(serde_json::json!({
+                "customProviders": [{
+                    "id": "test-provider", "baseUrl": format!("http://{address}/v1"),
+                    "api": "openai-responses", "apiKey": "test-key",
+                    "models": models.iter().map(|model| serde_json::json!({
+                        "id": model.id, "api": "openai-responses", "thinking": model.thinking,
+                        "defaultThinkingLevel": model.default_thinking_level,
+                        "configuration": model.configuration
+                    })).collect::<Vec<_>>()
+                }]
+            })).map_err(|error| error.to_string())?;
+            save_custom_providers(request)?;
+            let (written, _) = load_yaml(&home.join(".omp/agent/models.yml"))?;
+            Ok((models, written))
+        });
         if let Some(previous_home) = previous_home {
             env::set_var("HOME", previous_home);
         } else {
@@ -3956,12 +4027,23 @@ mod tests {
         }
         server.join().expect("discovery server should finish");
 
-        let models = result.expect("discovery should succeed");
+        let (models, written) = result.expect("discovery and save should succeed");
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "model-a");
         assert_eq!(models[0].name, "Model A");
         assert_eq!(models[0].thinking, vec!["low", "high"]);
         assert_eq!(models[0].default_thinking_level.as_deref(), Some("high"));
+        let saved = &written["providers"]["test-provider"]["models"][0];
+        assert_eq!(saved["contextWindow"].as_u64(), Some(240000));
+        assert_eq!(saved["maxTokens"].as_u64(), Some(32000));
+        assert_eq!(saved["maxContextWindow"].as_u64(), Some(1000000));
+        assert_eq!(saved["reasoning"].as_bool(), Some(false));
+        assert_eq!(saved["supportsTools"].as_bool(), Some(false));
+        assert_eq!(saved["input"], serde_yaml::to_value(["text"]).unwrap());
+        assert_eq!(saved["cost"]["input"].as_u64(), Some(0));
+        let reloaded = load_custom_providers(&written);
+        assert_eq!(reloaded[0].models[0].configuration["contextWindow"], 240000);
+        assert!(!reloaded[0].models[0].configuration.contains_key("compat"));
         assert!(models[1].thinking.is_empty());
         fs::remove_dir_all(home).expect("isolated test home should be removed");
     }

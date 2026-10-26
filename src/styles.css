@@ -290,6 +290,7 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
 .slot-card.rose { --slot-color: #d14e70; }
 .slot-card.red { --slot-color: #c43e45; }
 .slot-card.cyan { --slot-color: #1598a4; }
+.model-section-label { display: block; margin: 12px 0 8px; color: var(--muted-strong); font-size: 11px; font-weight: 650; }
 
 .custom-role-section,
 .agent-override-section,
@@ -307,8 +308,7 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
 }
-.policy-card,
-.fallback-card {
+.policy-card {
   min-width: 0;
   padding: 17px;
   border: 1px solid var(--border);
@@ -373,21 +373,25 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
 .policy-field-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .policy-effective { margin: auto 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .policy-effective strong { color: var(--muted-strong); }
-.fallback-card { margin-top: 14px; }
-.fallback-card.invalid { border-color: #e1a4a4; background: #fff9f9; }
+.role-fallback { min-width: 0; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.fallback-empty { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.fallback-advanced { margin-top: 16px; color: var(--muted-strong); font-size: 12px; }
+.fallback-advanced > summary { width: fit-content; cursor: pointer; }
+.fallback-advanced > .role-fallback { margin-top: 12px; }
 .fallback-heading { align-items: center; }
-.fallback-heading p { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.fallback-heading p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .fallback-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
 .fallback-chain {
   display: grid;
-  grid-template-columns: minmax(150px, 0.65fr) minmax(260px, 1.6fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: start;
   gap: 12px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--panel-raised);
 }
+.fallback-chain > .button { justify-self: start; }
+.fallback-chain + .fallback-chain { padding-top: 12px; border-top: 1px dashed var(--border); }
+.fallback-selector-row input { height: 38px; font-size: 13px; }
+.fallback-selector-row input:focus-visible,
+.fallback-advanced > summary:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), transparent 20%); outline-offset: 2px; }
 .fallback-selectors { display: flex; min-width: 0; flex-direction: column; gap: 7px; }
 .fallback-selector-row {
   display: grid;
@@ -417,7 +421,6 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
 .icon-button.danger,
 .button.danger { color: #ad4a4a; }
 .routing-errors { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; color: #ad4a4a; font-size: 11px; }
-:root[data-theme="dark"] .fallback-card.invalid { border-color: rgba(240, 122, 122, 0.48); background: rgba(155, 45, 45, 0.16); }
 :root[data-theme="dark"] .routing-errors,
 :root[data-theme="dark"] .icon-button.danger,
 :root[data-theme="dark"] .button.danger { color: #f0aaaa; }
@@ -954,7 +957,6 @@ select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), tran
   .agent-card-actions { width: 100%; grid-template-columns: auto 1fr auto; justify-items: start; }
   .agent-card-actions .button { grid-column: auto; margin-left: auto; }
   .policy-grid { grid-template-columns: 1fr; }
-  .fallback-chain { grid-template-columns: 1fr; }
   .custom-provider-form-grid { grid-template-columns: 1fr; }
   .custom-provider-model-list { grid-template-columns: 1fr; }
   .custom-provider-row { align-items: flex-start; flex-direction: column; }

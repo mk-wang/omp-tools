@@ -1,4 +1,4 @@
-import type { CustomProviderModel } from "./types";
+import type { CustomProviderModel, JsonObject, JsonValue } from "./types";
 
 export type CustomProviderEditor = {
   mode: "create" | "edit";
@@ -32,7 +32,19 @@ export const CUSTOM_PROVIDER_API_OPTIONS: readonly CustomProviderApiOption[] = [
   { value: "bedrock-converse-stream", label: "Bedrock Converse" },
   { value: "google-generative-ai", label: "Google Generative AI" },
   { value: "google-gemini-cli", label: "Google Gemini CLI" },
-  { value: "google-vertex", label: "Google Vertex" }
+  { value: "google-vertex", label: "Google Vertex" },
+  { value: "openrouter-decisions", label: "OpenRouter Decisions" },
+  { value: "openai-decisions", label: "OpenAI Decisions" },
+  { value: "workers-ai-systemone", label: "Workers AI System One" },
+  { value: "typesafe", label: "Typesafe" },
+  { value: "openai-images", label: "OpenAI Images" },
+  { value: "openrouter-images", label: "OpenRouter Images" },
+  { value: "xai-tts", label: "xAI TTS" },
+  { value: "openai-speech", label: "OpenAI Speech" },
+  { value: "openai-embeddings", label: "OpenAI Embeddings" },
+  { value: "openrouter-rerank", label: "OpenRouter Rerank" },
+  { value: "openrouter-video", label: "OpenRouter Video" },
+  { value: "openai-transcriptions", label: "OpenAI Transcriptions" }
 ];
 
 export const PI_CUSTOM_PROVIDER_API_OPTIONS: readonly CustomProviderApiOption[] = [
@@ -64,6 +76,54 @@ export function inferredCustomProviderApi(
     ?? fallbackApi;
 }
 
+function isJsonObject(value: JsonValue | undefined): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function mergeJsonObjects(base: JsonObject, overlay: JsonObject): JsonObject {
+  const merged: JsonObject = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    const prior = Object.hasOwn(base, key) ? base[key] : undefined;
+    // Arbitrary JSON keys (e.g. compat.extraBody "__proto__") must stay own data properties.
+    Object.defineProperty(merged, key, {
+      value: isJsonObject(prior) && isJsonObject(value) ? mergeJsonObjects(prior, value) : value,
+      enumerable: true,
+      writable: true,
+      configurable: true
+    });
+  }
+  return merged;
+}
+
+/** Keeps model metadata a partial refresh omits: refreshes win per leaf, stale leaves survive. */
+export function mergeDiscoveredModels(
+  previous: CustomProviderModel[],
+  discovered: CustomProviderModel[]
+): CustomProviderModel[] {
+  const previousById = new Map(previous.map(model => [model.id, model]));
+  const merged = discovered.map(model => {
+    const known = previousById.get(model.id);
+    if (!known) return model;
+    // Nested canonical metadata (including full thinking config) merges leaf-wise; flat fields stay as refreshed.
+    const configuration = isJsonObject(known.configuration) && isJsonObject(model.configuration)
+      ? mergeJsonObjects(known.configuration, model.configuration)
+      : model.configuration ?? known.configuration;
+    // Serde omits empty optional fields, so an absent key means "unchanged", not "cleared".
+    const thinking = model.thinking ?? known.thinking;
+    const defaultThinkingLevel = model.defaultThinkingLevel ?? known.defaultThinkingLevel;
+    const api = model.api || known.api;
+    return {
+      ...model,
+      ...(thinking ? { thinking } : {}),
+      ...(defaultThinkingLevel !== undefined ? { defaultThinkingLevel } : {}),
+      ...(api ? { api } : {}),
+      ...(configuration ? { configuration } : {})
+    };
+  });
+  const mergedIds = new Set(merged.map(model => model.id));
+  return [...merged, ...[...previousById.values()].filter(model => !mergedIds.has(model.id))];
+}
+
 export function customProviderApiOverrides(
   models: CustomProviderModel[],
   defaultApi: string
@@ -74,6 +134,10 @@ export function customProviderApiOverrides(
       return api && api !== defaultApi ? [[model.id, api] as const] : [];
     })
   );
+}
+
+export function customProviderApiOverride(overrides: Record<string, string>, modelId: string): string {
+  return Object.hasOwn(overrides, modelId) ? overrides[modelId] : "";
 }
 
 
@@ -126,7 +190,7 @@ export function CustomProviderModal({
     ? ""
     : `请选择 ${productName} 支持的 Type。`;
   const modelApiError = editor.models.some(modelId => {
-    const api = editor.modelApiOverrides[modelId]?.trim() || editor.api;
+    const api = customProviderApiOverride(editor.modelApiOverrides, modelId).trim() || editor.api;
     return !apiOptions.some(option => option.value === api);
   })
     ? "请选择每个 model 支持的 Type。"
@@ -147,19 +211,21 @@ export function CustomProviderModal({
     : editor.models.filter(modelId => !discoveredModelIds.includes(modelId));
   const unavailableModelSet = new Set(unavailableModelIds);
   const availableModelIds = new Set(editor.availableModels.map(model => model.id));
+  const offeredModelIds = new Set(discoveredModelIds ?? []);
   const staleSelectedModels = discoveredModelIds === null
     ? []
     : editor.models
       .filter(modelId => !availableModelIds.has(modelId))
       .map(id => ({ id, name: id }));
+  // Retained metadata for models the refresh dropped stays out of the picker unless selected.
   const modelOptions = sortedCustomProviderModels([
-    ...editor.availableModels,
+    ...editor.availableModels.filter(model => offeredModelIds.has(model.id) || selectedModels.has(model.id)),
     ...staleSelectedModels
   ]);
 
   const updateModelApi = (modelId: string, api: string) => {
     const modelApiOverrides = { ...editor.modelApiOverrides };
-    if (api) modelApiOverrides[modelId] = api;
+    if (api) Object.defineProperty(modelApiOverrides, modelId, { value: api, enumerable: true, writable: true, configurable: true });
     else delete modelApiOverrides[modelId];
     onChange({ ...editor, modelApiOverrides });
   };
@@ -252,7 +318,7 @@ export function CustomProviderModal({
               {modelOptions.map(model => {
                 const selected = selectedModels.has(model.id);
                 const isUnavailable = unavailableModelSet.has(model.id);
-                const override = editor.modelApiOverrides[model.id] ?? "";
+                const override = customProviderApiOverride(editor.modelApiOverrides, model.id);
                 const metadata = [
                   model.name !== model.id ? model.name : "",
                   model.thinking?.length ? `thinking: ${model.thinking.join(", ")}` : ""

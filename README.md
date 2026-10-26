@@ -12,9 +12,9 @@ OMP Model Studio 是一个基于 Tauri 2、React 19 和 Rust 的桌面控制面�
 - **自定义 Agent**：创建和编辑 `~/.omp/agent/agents/*.md`，使用 YAML frontmatter 描述名称、用途和模型 Role。
 - **模型能力与价格**：从 `omp models --json` 展示输入能力、thinking、上下文、输出上限及 input/output/cache 价格。
 - **路由策略**：配置全局 thinking、auto thinking 上限、Advisor runtime、Prewalk 和 retry model fallback。
-- **Fallback chain**：按 Role、具体模型或 provider wildcard 维护有序候选，并校验空值、重复、自循环和 shadowed provider。
+- **Fallback chain**：在内建和自定义 Role 卡片内，将主模型与有序 fallback 候选一起展示和编辑；模型或 provider wildcard 的通用规则位于模型区域的“模型 / Provider 通用回退”中。保留空值、重复、自循环和 shadowed provider 校验。
 - **Provider 管理与一键切换**：Provider 列表严格来自 `omp models --json` 的当前可用结果（OMP 已按 `disabledProviders` 过滤模型）；勾掉某个 provider 的 Use 只在当前草稿中 shadow 它，并立即把每个受影响 Role 切换到其 fallback chain 中下一个可用候选。被 Agent 或 Agent override 使用的 provider 会显示为 Used；若仍引用 shadowed provider 会标红并阻止 Apply。Apply 不会读取或修改 OMP 真实的 `disabledProviders`。
-- **Custom provider**：填写 provider ID、API key、Base URL 和总 API type；总 Type 作为默认值，单个 model 可额外覆盖为另一种 API，通过 provider 的 `/models` endpoint 获取可用 model list，并自动尝试兼容的 rich catalog 读取 thinking effort；保存时，`openai-completions` 和 `openai-responses` model 会自动补上 `compat.promptCacheSessionHeader: X-Session-Id`，便于经 CPA 等自定义网关透传会话身份；再勾选模型并立即独立写入 `~/.omp/agent/models.yml`；不依赖全局 Apply。
+- **Custom provider**：填写 provider ID、API key、Base URL 和默认 API type；单个 model 可覆盖 Type。通过 `/models` 获取可用模型，并尝试 rich catalog 补充能力。保存时传递上下文、输出上限、价格、输入能力及完整 thinking 配置，不再统一覆盖输入和 reasoning。OpenAI Completions/Responses model 仍默认补充 `compat.promptCacheSessionHeader: X-Session-Id`。勾选的模型立即写入 `~/.omp/agent/models.yml`，不依赖全局 Apply。
 - **直接编辑配置文件**：Header 可打开 `config.yml`，Custom Provider 区域可打开 `models.yml`，外部保存后点击“重新读取”加载最新内容。
 - **完整路由预设与主题**：在 WebView `localStorage` 中保存模型 Role、Agent 覆盖、路由策略和 provider 状态；Agent Markdown 保持独立。
 - **安全写入**：配置文件、`models.yml` 和 Agent Markdown 使用同目录临时文件写入后原子替换。
@@ -83,15 +83,18 @@ omp models --json
 
 1. 安装 OMP，并确认 `omp models --json` 可以执行。
 2. 启动 `bun run tauri dev`。
-3. 在全部内建模型 Role 卡片中选择模型和 thinking effort。
-4. 按需新增 custom provider，填写 API key、Base URL 和总 Type；点击获取完整 model list 后，应用会叠加可用的 thinking effort 元数据，并在每个 model 行单独覆盖 Type；点击 **保存 Provider** 后立即写入 `models.yml`。
-5. 配置全局 thinking、Advisor、Prewalk 与 fallback chain。
+3. 在内建模型 Role 卡片中选择主模型和 thinking effort，并在同一卡片下方配置 fallback 候选。
+4. 按需新增 custom provider，填写 API key、Base URL 和默认 Type。获取 model list 后，应用保留上游提供的模型元数据。可在每个 model 行覆盖 Type；点击 **保存 Provider** 后立即写入 `models.yml`。
+5. 配置全局 thinking、Advisor、Prewalk 与 retry 策略。按需展开模型区域的“模型 / Provider 通用回退”，编辑具体模型或 provider wildcard 的回退规则。
 6. 按需新增自定义 Role 或自定义 Agent，在 Agent 模型覆盖区域调整已发现 Agent 的模型策略，并调整 provider 状态。
 7. 确认没有非法选择后点击 **Apply**，将 Role、Agent 覆盖、路由策略和 Agent 草稿写入 `config.yml` 与 Agent 文件；Custom Provider 不参与此操作。
 模型 Role、Agent 和路由策略编辑先保存在应用草稿中，不会在点击 **Apply** 前写入磁盘。Custom Provider 是例外：点击 **保存 Provider** 或确认删除后，会独立写入 `models.yml`。
 
+保存 Custom Provider 不检查模型是否仍被 config 引用，也不自动修改这些引用。保存成功后，应用重新读取磁盘 config，并复用现有校验提示非法模型或引用。重新读取会替换尚未 Apply 的草稿，与手动“重新读取”一致。Provider 参数和模型元数据的格式校验仍在保存前执行。
+
 - Custom provider ID 只能包含字母、数字、`-`、`_`、`.`；Base URL 必须是 `http://` 或 `https://`；总 Type 和每个 model 的最终 Type 必须是 OMP 支持的 API；必须成功获取 model list，并至少勾选一个 model。
-- Model list 请求：Base URL 已带 `/vN` 时请求 `<baseUrl>/models`，否则依次尝试 `<baseUrl>/v1/models` 与 `<baseUrl>/v3/models`；请求发送 `Authorization: Bearer <apiKey>`，`anthropic-messages` 额外发送 `x-api-key` 和 `anthropic-version: 2023-06-01`。普通 model list 是可用模型的权威来源；若 endpoint 接受 `?client_version=0.144.0`，应用会将 `slug`、`supported_reasoning_levels[].effort` 和 `default_reasoning_level` 作为可选能力 overlay，忽略 `visibility: hide` 的能力及 OMP/Pi 当前不支持的 `ultra`。
+- Model list 请求：Base URL 已带 `/vN` 时请求 `<baseUrl>/models`，否则依次尝试 `<baseUrl>/v1/models` 与 `<baseUrl>/v3/models`。请求发送 `Authorization: Bearer <apiKey>`；Anthropic 还发送对应鉴权头。普通列表决定可用模型和已返回的容量；可选 `?client_version=0.144.1` rich catalog 补充缺失元数据及 thinking effort，不添加普通列表没有的模型。忽略 `visibility: hide` 的能力及当前不支持的 `ultra`。
+- 容量字段：`context_length`、`max_model_len`、`context_window` 映射到 `contextWindow`；`max_output_tokens`、`max_completion_tokens`、`top_provider.max_completion_tokens`、`max_tokens` 映射到 `maxTokens`。`limits.max_input_tokens` 和 `limits.max_output_tokens` 同时存在时，两者之和可提供上下文窗口。容量别名接受正的安全整数及其数字字符串；未返回的容量不猜值。
 - 自定义 Role 名称不能覆盖 OMP 系统 Role，且必须以小写字母开头，只能包含小写字母、数字、`-`、`_`。
 - 自定义 Role 必须选择模型。
 - Agent Markdown 必须包含 `name`、`description`、`model` 三个 frontmatter 字段，并包含非空正文。
@@ -115,7 +118,9 @@ Run the release verification workflow and report concrete findings.
 ## 配置写入与数据边界
 
 - 后端只更新受管理的 YAML 映射：`config.yml` 中的 `modelRoles`、`task.agentModelOverrides`、thinking/Advisor/Prewalk 设置和 `retry.fallbackChains`；`disabledProviders` 不属于本工具的 OMP shadow 状态，Apply 会保留其现有值；其余未识别的 config 键也会保留。
-- `models.yml` 中只 upsert 当前 custom provider 明确管理的 `baseUrl`、`apiKey` 和勾选的 `models`；每个保存的 model 都带自己的 `api`，并统一写入 `input: [text, image]` 和 `reasoning: true`，包括覆盖已有的这两个字段。托管 provider 不再写 provider-level `api`。OpenAI Completions/Responses model 保存时默认写入 `compat.promptCacheSessionHeader: X-Session-Id`；其余已有 model 元数据、compat 字段及 provider headers 等未管理字段保留。只有用户明确删除的 provider 才会移除；override-only/discovery provider 不会被编辑器接管。Pi 的 `models.json` 不使用这两个统一默认值。
+- `models.yml` 只更新受管理 provider 的 `baseUrl`、`apiKey` 和选中的 `models`。每个 model 保存独立 `api`；模型元数据包括名称、kind、容量、输入、reasoning、完整 thinking、价格、缓存、tokenizer 和工具能力。显式 `false`、`0` 及已有的缺失字段保留；嵌套对象按字段合并。不会强制写入图片输入或 `reasoning: true`。托管 provider 不再写 provider-level `api`。
+- 远端 model catalog 不能改写 model-level `baseUrl`、`headers`、`compat`、`remoteCompaction`、`compactionModel` 或 `contextPromotionTarget`。这些已有 model-level 配置保留在磁盘，不返回 WebView；provider-level Base URL 仍由编辑器管理。OpenAI Completions/Responses model 仍在缺失时补充会话 header 兼容设置。只有用户明确删除的 provider 才会移除；override-only/discovery provider 不由编辑器管理。
+- OMP 与 Pi 分别按自己的 schema 保存模型元数据。Pi 接收共同支持的名称、reasoning、输入、价格、上下文和输出上限；thinking effort 转为 Pi 的 `thinkingLevelMap`，不会写入 OMP 专有字段。
 - Provider shadow 状态是 WebView 本地草稿：只针对当前 `omp models --json` 返回的 provider 生效，不从 `disabledProviders` 载入，也不会写回该字段；预设可以保存这份本地 shadow 状态。
 - Custom provider 的 API key 只会由 **保存 Provider** 写入本机 `models.yml`；读取已有配置时只返回“已配置”状态，不把密钥返回到 WebView。
 - YAML 会经过 `serde_yaml` 重新序列化，因此格式和注释可能被重写；如需保留原始格式，请在写入前备份文件。

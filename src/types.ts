@@ -20,12 +20,20 @@ export type ModelOption = {
   kind: string;
 };
 
+export type JsonPrimitive = string | number | boolean | null;
+
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export type JsonObject = { [key: string]: JsonValue };
+
 export type CustomProviderModel = {
   id: string;
   name: string;
   api?: string;
   thinking?: string[];
   defaultThinkingLevel?: string;
+  /** Canonical OMP model capabilities; excludes identity, routing and credential settings. */
+  configuration?: JsonObject;
 };
 
 export type CustomProviderSaveModel = {
@@ -33,6 +41,7 @@ export type CustomProviderSaveModel = {
   api: string;
   thinking?: string[];
   defaultThinkingLevel?: string | null;
+  configuration?: JsonObject;
 };
 
 export type CustomProvider = {

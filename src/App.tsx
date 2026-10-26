@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { discoverCustomProviderModels, loadSnapshot, openConfigFile, saveCustomProviders, saveSnapshot } from "./api";
 import {
   CUSTOM_PROVIDER_API_OPTIONS,
   CUSTOM_PROVIDER_PATTERN,
   CustomProviderModal,
   customProviderApiOverrides,
+  customProviderApiOverride,
   inferredCustomProviderApi,
+  mergeDiscoveredModels,
   sortedCustomProviderModels,
   type CustomProviderEditor
 } from "./CustomProviderModal";
@@ -339,13 +341,6 @@ function withEffort(base: string, effort: string): string {
 function providerForSelector(value: string): string {
   const base = splitSelector(value).base;
   return base.includes("/") ? base.split("/")[0] : "";
-}
-
-
-function modelIdForProviderSelector(value: string, provider: string): string {
-  const base = splitSelector(value).base;
-  const prefix = `${provider}/`;
-  return base.startsWith(prefix) ? base.slice(prefix.length) : "";
 }
 
 
@@ -884,79 +879,175 @@ function optionalBooleanFromControl(value: string): boolean | null {
   return null;
 }
 
-function RoutingPolicySection({
+function FallbackSettings({
   settings,
-  models,
-  shadowedProviders,
-  roleNames,
-  errors,
+  target,
+  roleTargets = [],
   onChange
 }: {
   settings: RoutingSettings;
+  target?: string;
+  roleTargets?: string[];
+  onChange: (settings: RoutingSettings) => void;
+}) {
+  const entries = settings.retryFallbackChains
+    .map((chain, index) => ({ chain, index }))
+    .filter(({ chain }) => target !== undefined
+      ? chain.target.trim() === target
+      : !roleTargets.includes(chain.target.trim()));
+
+  const replaceChain = (index: number, chain: FallbackChain) => onChange({
+    ...settings,
+    retryFallbackChains: settings.retryFallbackChains.map((current, currentIndex) =>
+      currentIndex === index ? chain : current)
+  });
+  const removeChain = (index: number) => onChange({
+    ...settings,
+    retryFallbackChains: settings.retryFallbackChains.filter((_, currentIndex) => currentIndex !== index)
+  });
+  const addFallback = () => {
+    const entry = target !== undefined ? entries[0] : undefined;
+    if (entry) {
+      replaceChain(entry.index, { ...entry.chain, selectors: [...entry.chain.selectors, ""] });
+    } else {
+      onChange({
+        ...settings,
+        retryFallbackChains: [...settings.retryFallbackChains, { target: target ?? "", selectors: [""] }]
+      });
+    }
+  };
+  const moveSelector = (chainIndex: number, selectorIndex: number, offset: -1 | 1) => {
+    const chain = settings.retryFallbackChains[chainIndex];
+    const nextIndex = selectorIndex + offset;
+    if (!chain || nextIndex < 0 || nextIndex >= chain.selectors.length) return;
+    const selectors = [...chain.selectors];
+    [selectors[selectorIndex], selectors[nextIndex]] = [selectors[nextIndex], selectors[selectorIndex]];
+    replaceChain(chainIndex, { ...chain, selectors });
+  };
+
+  return (
+    <section className="role-fallback" aria-label={target ? `${target} fallback` : "通用回退规则"}>
+      <div className="fallback-heading">
+        <div>
+          <span>{target ? "FALLBACK" : "通用回退规则"}</span>
+          <p>{settings.retryModelFallback === false ? "已关闭回退 · 配置仍会保留" : "主模型不可用时，按编号顺序尝试"}</p>
+        </div>
+        <button className="button quiet compact" onClick={addFallback}>
+          {target ? "添加回退" : "新增规则"}
+        </button>
+      </div>
+      {entries.length > 0 ? (
+        <div className="fallback-list">
+          {entries.map(({ chain, index }) => (
+            <div className="fallback-chain" key={index}>
+              {target === undefined && (
+                <label className="policy-field fallback-target">
+                  <span>Target · 具体模型 / Provider</span>
+                  <input
+                    list="fallback-target-options"
+                    value={chain.target}
+                    onChange={event => replaceChain(index, { ...chain, target: event.target.value })}
+                    placeholder="provider/model 或 provider/*"
+                  />
+                </label>
+              )}
+              <div className="fallback-selectors">
+                {chain.selectors.map((selector, selectorIndex) => (
+                  <div className="fallback-selector-row" key={selectorIndex}>
+                    <span className="fallback-order">{selectorIndex + 1}</span>
+                    <input
+                      list="fallback-selector-options"
+                      value={selector}
+                      onChange={event => {
+                        const selectors = [...chain.selectors];
+                        selectors[selectorIndex] = event.target.value;
+                        replaceChain(index, { ...chain, selectors });
+                      }}
+                      placeholder="provider/model[:thinking] 或 @role"
+                      aria-label={`Fallback ${selectorIndex + 1} for ${chain.target || "new target"}`}
+                      title={selector}
+                    />
+                    <button
+                      className="icon-button"
+                      onClick={() => moveSelector(index, selectorIndex, -1)}
+                      disabled={selectorIndex === 0}
+                      aria-label={`Move fallback ${selectorIndex + 1} up for ${chain.target}`}
+                    >↑</button>
+                    <button
+                      className="icon-button"
+                      onClick={() => moveSelector(index, selectorIndex, 1)}
+                      disabled={selectorIndex === chain.selectors.length - 1}
+                      aria-label={`Move fallback ${selectorIndex + 1} down for ${chain.target}`}
+                    >↓</button>
+                    <button
+                      className="icon-button danger"
+                      onClick={() => replaceChain(index, {
+                        ...chain,
+                        selectors: chain.selectors.filter((_, currentIndex) => currentIndex !== selectorIndex)
+                      })}
+                      aria-label={`Remove fallback ${selectorIndex + 1} for ${chain.target}`}
+                    >×</button>
+                  </div>
+                ))}
+                {target === undefined && (
+                  <button className="button quiet compact" onClick={() => replaceChain(index, {
+                    ...chain,
+                    selectors: [...chain.selectors, ""]
+                  })}>添加候选</button>
+                )}
+              </div>
+              <button className="button quiet compact danger" onClick={() => removeChain(index)}>
+                {target ? "清除回退" : "删除规则"}
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="fallback-empty">{target ? "未配置此 Role 的回退；可添加候选。" : "没有通用回退规则；Role 回退在对应主模型下设置。"}</p>
+      )}
+    </section>
+  );
+}
+
+function FallbackOptions({ models, shadowedProviders, roleNames }: {
   models: ModelOption[];
   shadowedProviders: string[];
   roleNames: string[];
-  errors: string[];
+}) {
+  const selectableModels = models.filter(model => !shadowedProviders.includes(model.provider));
+  const providers = [...new Set(selectableModels.map(model => model.provider))].sort();
+  const targets = [...new Set([
+    ...roleNames,
+    ...selectableModels.map(model => model.selector),
+    ...providers.map(provider => `${provider}/*`)
+  ])];
+  const selectors = [...new Set([
+    ...roleNames.map(role => `@${role}`),
+    ...selectableModels.map(model => model.selector),
+    ...providers.map(provider => `${provider}/*`)
+  ])];
+  return (
+    <>
+      <datalist id="fallback-target-options">
+        {targets.map(value => <option value={value} key={value} />)}
+      </datalist>
+      <datalist id="fallback-selector-options">
+        {selectors.map(value => <option value={value} key={value} />)}
+      </datalist>
+    </>
+  );
+}
+
+function RoutingPolicySection({
+  settings,
+  onChange
+}: {
+  settings: RoutingSettings;
   onChange: (settings: RoutingSettings) => void;
 }) {
   const effectiveThinking = settings.defaultThinkingLevel ?? "high";
   const effectiveAdvisor = settings.advisorEnabled ?? false;
   const effectiveFallback = settings.retryModelFallback ?? true;
-  const shadowedProviderSet = new Set(shadowedProviders);
-  const selectableModels = useMemo(
-    () => models.filter(model => !shadowedProviderSet.has(model.provider)),
-    [models, shadowedProviders]
-  );
-  const providers = useMemo(
-    () => [...new Set(selectableModels.map(model => model.provider))].sort((left, right) => left.localeCompare(right)),
-    [selectableModels]
-  );
-  const targetSuggestions = useMemo(
-    () => [
-      ...new Set([
-        ...roleNames,
-        ...selectableModels.map(model => model.selector),
-        ...providers.map(provider => `${provider}/*`)
-      ])
-    ],
-    [providers, roleNames, selectableModels]
-  );
-  const selectorSuggestions = useMemo(
-    () => [
-      ...new Set([
-        ...roleNames.map(role => `@${role}`),
-        ...selectableModels.map(model => model.selector),
-        ...providers.map(provider => `${provider}/*`)
-      ])
-    ],
-    [providers, roleNames, selectableModels]
-  );
-
-  const replaceChain = (index: number, chain: FallbackChain) => {
-    const retryFallbackChains = settings.retryFallbackChains.map((current, currentIndex) =>
-      currentIndex === index ? chain : current
-    );
-    onChange({ ...settings, retryFallbackChains });
-  };
-
-  const moveChainSelector = (chainIndex: number, selectorIndex: number, offset: -1 | 1) => {
-    const chain = settings.retryFallbackChains[chainIndex];
-    const targetIndex = selectorIndex + offset;
-    if (!chain || targetIndex < 0 || targetIndex >= chain.selectors.length) return;
-    const selectors = [...chain.selectors];
-    [selectors[selectorIndex], selectors[targetIndex]] = [selectors[targetIndex], selectors[selectorIndex]];
-    replaceChain(chainIndex, { ...chain, selectors });
-  };
-
-  const addChain = () => {
-    const existingTargets = new Set(settings.retryFallbackChains.map(chain => chain.target));
-    const target = roleNames.find(role => !existingTargets.has(role)) ?? "";
-    onChange({
-      ...settings,
-      retryFallbackChains: [...settings.retryFallbackChains, { target, selectors: [""] }]
-    });
-  };
-
   return (
     <section className="routing-section">
       <div className="custom-role-heading">
@@ -1113,102 +1204,6 @@ function RoutingPolicySection({
           </p>
         </article>
       </div>
-
-      <article className={`fallback-card${errors.length ? " invalid" : ""}`}>
-        <div className="fallback-heading">
-          <div>
-            <span>FALLBACK CHAINS</span>
-            <p>Target 可使用 Role、具体模型或 provider wildcard；候选按顺序尝试。</p>
-          </div>
-          <button className="button compact" onClick={addChain}>新增链</button>
-        </div>
-        <datalist id="fallback-target-options">
-          {targetSuggestions.map(value => <option value={value} key={value} />)}
-        </datalist>
-        <datalist id="fallback-selector-options">
-          {selectorSuggestions.map(value => <option value={value} key={value} />)}
-        </datalist>
-        {settings.retryFallbackChains.length > 0 ? (
-          <div className="fallback-list">
-            {settings.retryFallbackChains.map((chain, chainIndex) => (
-              <div className="fallback-chain" key={chainIndex}>
-                <label className="policy-field fallback-target">
-                  <span>Target</span>
-                  <input
-                    list="fallback-target-options"
-                    value={chain.target}
-                    onChange={event => replaceChain(chainIndex, { ...chain, target: event.target.value })}
-                    placeholder="default 或 provider/*"
-                  />
-                </label>
-                <div className="fallback-selectors">
-                  {chain.selectors.map((selector, selectorIndex) => (
-                    <div className="fallback-selector-row" key={selectorIndex}>
-                      <span className="fallback-order">{selectorIndex + 1}</span>
-                      <input
-                        list="fallback-selector-options"
-                        value={selector}
-                        onChange={event => {
-                          const selectors = [...chain.selectors];
-                          selectors[selectorIndex] = event.target.value;
-                          replaceChain(chainIndex, { ...chain, selectors });
-                        }}
-                        placeholder="provider/model[:thinking] 或 @role"
-                        aria-label={`Fallback ${selectorIndex + 1} for ${chain.target || "new target"}`}
-                      />
-                      <button
-                        className="icon-button"
-                        onClick={() => moveChainSelector(chainIndex, selectorIndex, -1)}
-                        disabled={selectorIndex === 0}
-                        aria-label="Move fallback up"
-                      >↑</button>
-                      <button
-                        className="icon-button"
-                        onClick={() => moveChainSelector(chainIndex, selectorIndex, 1)}
-                        disabled={selectorIndex === chain.selectors.length - 1}
-                        aria-label="Move fallback down"
-                      >↓</button>
-                      <button
-                        className="icon-button danger"
-                        onClick={() => replaceChain(chainIndex, {
-                          ...chain,
-                          selectors: chain.selectors.filter((_, index) => index !== selectorIndex)
-                        })}
-                        aria-label="Remove fallback"
-                      >×</button>
-                    </div>
-                  ))}
-                  <button
-                    className="button quiet compact"
-                    onClick={() => replaceChain(chainIndex, {
-                      ...chain,
-                      selectors: [...chain.selectors, ""]
-                    })}
-                  >
-                    添加候选
-                  </button>
-                </div>
-                <button
-                  className="button quiet compact danger"
-                  onClick={() => onChange({
-                    ...settings,
-                    retryFallbackChains: settings.retryFallbackChains.filter((_, index) => index !== chainIndex)
-                  })}
-                >
-                  删除链
-                </button>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="custom-role-empty">没有配置 fallback chain；OMP 只使用自身的凭据与重试恢复。</div>
-        )}
-        {errors.length > 0 && (
-          <div className="routing-errors">
-            {errors.map(error => <span key={error}>{error}</span>)}
-          </div>
-        )}
-      </article>
     </section>
   );
 }
@@ -1224,7 +1219,8 @@ function SlotCard({
   securityReviewerFollowsSlow,
   slowValue,
   onChange,
-  onFollowChange
+  onFollowChange,
+  children
 }: {
   definition: SlotDefinition;
   value: string;
@@ -1237,6 +1233,7 @@ function SlotCard({
   slowValue: string;
   onChange: (value: string) => void;
   onFollowChange: (key: "reviewer" | "securityReviewer", follow: boolean) => void;
+  children?: ReactNode;
 }) {
   const isReviewer = definition.key === "reviewer";
   const isSecurityReviewer = definition.key === "securityReviewer";
@@ -1296,6 +1293,7 @@ function SlotCard({
       {followsSlow && (
         <code className="inherited-model">{effectiveValue || "尚未选择"}</code>
       )}
+      <span className="model-section-label">主模型</span>
       {(!isFollowable || !followsSlow) && (
         <ModelPicker
           value={value}
@@ -1305,6 +1303,7 @@ function SlotCard({
           onChange={onChange}
         />
       )}
+      {children}
 
     </article>
   );
@@ -1419,7 +1418,8 @@ function CustomRoleCard({
   shadowedProviders,
   deletePending,
   onChange,
-  onDelete
+  onDelete,
+  children
 }: {
   customRole: CustomRole;
   models: ModelOption[];
@@ -1428,6 +1428,7 @@ function CustomRoleCard({
   deletePending: boolean;
   onChange: (value: string) => void;
   onDelete: () => void;
+  children?: ReactNode;
 }) {
   const provider = providerForSelector(customRole.value);
   const isShadowed = Boolean(provider && shadowedProviders.includes(provider));
@@ -1461,6 +1462,7 @@ function CustomRoleCard({
           </button>
         </div>
       </div>
+      <span className="model-section-label">主模型</span>
       <ModelPicker
         value={customRole.value}
         models={models}
@@ -1468,6 +1470,7 @@ function CustomRoleCard({
         shadowedProviders={shadowedProviders}
         onChange={onChange}
       />
+      {children}
     </article>
   );
 }
@@ -2189,17 +2192,27 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         ) {
           return current;
         }
+        const configured = current.mode === "edit"
+          ? customProviders.find(provider => provider.id === current.originalId)
+          : undefined;
+        // Configured leaves seed the merge only while the editor still targets the same endpoint and Type.
+        const configuredModels = configured
+          && configured.baseUrl.trim() === current.baseUrl.trim()
+          && current.api === inferredCustomProviderApi(configured.api, configured.models, CUSTOM_PROVIDER_API_OPTIONS[0].value)
+          ? configured.models
+          : [];
+        const mergedModels = mergeDiscoveredModels([...configuredModels, ...current.availableModels], models);
         const modelApiOverrides = { ...current.modelApiOverrides };
-        models.forEach(model => {
+        mergedModels.forEach(model => {
           if (model.api && model.api !== current.api && !Object.hasOwn(modelApiOverrides, model.id)) {
-            modelApiOverrides[model.id] = model.api;
+            Object.defineProperty(modelApiOverrides, model.id, { value: model.api, enumerable: true, writable: true, configurable: true });
           }
         });
         return {
           ...current,
           modelApiOverrides,
           discoveredModelIds: models.map(model => model.id),
-          availableModels: models
+          availableModels: mergedModels
         };
       });
       if (models.length === 0) {
@@ -2230,13 +2243,15 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
             id: model.id,
             api: model.api?.trim() || provider.api,
             thinking: model.thinking ?? [],
-            defaultThinkingLevel: model.defaultThinkingLevel ?? null
+            defaultThinkingLevel: model.defaultThinkingLevel ?? null,
+            configuration: model.configuration
           }))
         })),
         removedCustomProviders: removedProviderIds
       });
       setCustomProviders(savedProviders);
       setSnapshot(current => current ? { ...current, customProviders: savedProviders } : current);
+      await refresh();
       return true;
     } catch (saveError) {
       const message = readableError(saveError);
@@ -2279,7 +2294,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     if (!customProviderEditor || customProviderSaving) return;
     const editor = customProviderEditor;
     const id = editor.id.trim();
-    const selectedModels = new Set(editor.models);
     const duplicate = editor.mode === "create" && customProviders.some(provider => provider.id === id);
     const validationError = !id
       ? "请输入 provider ID。"
@@ -2292,7 +2306,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
             : !CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === editor.api)
               ? "请选择 OMP 支持的 Type。"
               : editor.models.some(modelId => {
-                  const api = editor.modelApiOverrides[modelId]?.trim() || editor.api;
+                  const api = customProviderApiOverride(editor.modelApiOverrides, modelId).trim() || editor.api;
                   return !CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === api);
                 })
                 ? "请选择每个 model 支持的 Type。"
@@ -2307,29 +2321,15 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       setCustomProviderSaveError(validationError);
       return;
     }
-    const missingReferences = [...new Set([
-      ...selectedModelSlots
-        .filter(item => providerForSelector(item.value) === id)
-        .filter(item => {
-          const modelId = modelIdForProviderSelector(item.value, id);
-          return modelId === "*" || !selectedModels.has(modelId);
-        })
-        .map(item => item.label),
-      ...customAgents
-        .filter(agent => providerForSelector(agent.model) === id)
-        .filter(agent => {
-          const modelId = modelIdForProviderSelector(agent.model, id);
-          return modelId === "*" || !selectedModels.has(modelId);
-        })
-        .map(agent => `Agent ${agent.name}`)
-    ])];
-    if (missingReferences.length > 0) {
-      setCustomProviderSaveError(`不能取消使用 provider “${id}”的 model；仍被 ${missingReferences.join("、")} 引用。`);
-      return;
-    }
 
     const apiKey = editor.apiKey.trim();
-    const availableById = new Map(editor.availableModels.map(model => [model.id, model]));
+    const configuredModels = editor.mode === "edit"
+      ? customProviders.find(provider => provider.id === editor.originalId)?.models ?? []
+      : [];
+    // Refreshed metadata wins; configured metadata covers selected models the refresh omitted.
+    const availableById = new Map(
+      [...configuredModels, ...editor.availableModels].map(model => [model.id, model])
+    );
     const nextProvider: CustomProvider = {
       id,
       baseUrl: editor.baseUrl.trim(),
@@ -2341,7 +2341,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
           const model = availableById.get(modelId) ?? { id: modelId, name: modelId };
           return {
             ...model,
-            api: editor.modelApiOverrides[modelId]?.trim() || editor.api
+            api: customProviderApiOverride(editor.modelApiOverrides, modelId).trim() || editor.api
           };
         })
       )
@@ -2357,7 +2357,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     if (!saved) return;
     setPendingDeleteCustomProvider("");
     setCustomProviderEditor(null);
-    setError("");
   };
 
   const removeCustomProvider = async (id: string) => {
@@ -2386,7 +2385,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     if (!saved) return;
     setPendingDeleteCustomProvider("");
     setCustomProviderEditor(null);
-    setError("");
   };
 
   const startAgent = () => {
@@ -2963,15 +2961,38 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
                 slowValue={values.slow}
                 onChange={value => updateValue(definition.key, value)}
                 onFollowChange={updateReviewerMode}
-              />
+              >
+                <FallbackSettings
+                  settings={routingSettings}
+                  target={definition.key}
+                  onChange={updateRoutingSettings}
+                />
+              </SlotCard>
             ))}
           </div>
-          <RoutingPolicySection
-            settings={routingSettings}
-            models={snapshot?.models ?? []}
+          <FallbackOptions
+            models={[...availableModels, ...kindModels]}
             shadowedProviders={shadowedProviders}
             roleNames={roleNames}
-            errors={routingErrors}
+          />
+          {routingErrors.length > 0 && (
+            <div className="routing-errors" role="alert">
+              {routingErrors.map(error => <span key={error}>{error}</span>)}
+            </div>
+          )}
+          <details className="fallback-advanced">
+            <summary>模型 / Provider 通用回退</summary>
+            <FallbackSettings
+              settings={routingSettings}
+              roleTargets={[
+                ...MODEL_ROLE_DEFINITIONS.map(definition => definition.key),
+                ...customRoles.map(customRole => customRole.role)
+              ]}
+              onChange={updateRoutingSettings}
+            />
+          </details>
+          <RoutingPolicySection
+            settings={routingSettings}
             onChange={updateRoutingSettings}
           />
 
@@ -3043,7 +3064,13 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
                     deletePending={pendingDeleteCustomRole === customRole.role}
                     onChange={value => updateCustomRoleValue(customRole.role, value)}
                     onDelete={() => removeCustomRole(customRole.role)}
-                  />
+                  >
+                    <FallbackSettings
+                      settings={routingSettings}
+                      target={customRole.role}
+                      onChange={updateRoutingSettings}
+                    />
+                  </CustomRoleCard>
                 ))}
               </div>
             ) : (
