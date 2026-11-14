@@ -119,6 +119,8 @@ Run the release verification workflow and report concrete findings.
 
 - 后端只更新受管理的 YAML 映射：`config.yml` 中的 `modelRoles`、`task.agentModelOverrides`、thinking/Advisor/Prewalk 设置和 `retry.fallbackChains`；`disabledProviders` 不属于本工具的 OMP shadow 状态，Apply 会保留其现有值；其余未识别的 config 键也会保留。
 - `models.yml` 只更新受管理 provider 的 `baseUrl`、`apiKey` 和选中的 `models`。每个 model 保存独立 `api`；模型元数据包括名称、kind、容量、输入、reasoning、完整 thinking、价格、缓存、tokenizer 和工具能力。显式 `false`、`0` 及已有的缺失字段保留；嵌套对象按字段合并。不会强制写入图片输入或 `reasoning: true`。托管 provider 不再写 provider-level `api`。
+- Rich catalog 只提供推理档位时，OMP 按 API 和模型身份生成 `thinking`。`anthropic-messages` 只为可识别的 adaptive Claude 生成 `anthropic-adaptive`：Sonnet/Opus 4.6+，以及 Sonnet、Opus、Haiku、Fable、Mythos 的 5+ 版本。旧版和不透明别名保留 OMP 原生推断。已有完整 `thinking` 优先，不推断未公布的价格和输出上限。
+- Rich catalog 请求最多等待 60 秒。只有 HTTP 404/405 表示接口不可用；超时、服务错误或无效响应会显示获取失败，不再静默丢弃 metadata。`context_window`、`max_context_window` 和 `input_modalities` 转为对应 OMP 字段，已有 canonical 字段优先。API type 始终保留用户选择。
 - 远端 model catalog 不能改写 model-level `baseUrl`、`headers`、`compat`、`remoteCompaction`、`compactionModel` 或 `contextPromotionTarget`。这些已有 model-level 配置保留在磁盘，不返回 WebView；provider-level Base URL 仍由编辑器管理。OpenAI Completions/Responses model 仍在缺失时补充会话 header 兼容设置。只有用户明确删除的 provider 才会移除；override-only/discovery provider 不由编辑器管理。
 - OMP 与 Pi 分别按自己的 schema 保存模型元数据。Pi 接收共同支持的名称、reasoning、输入、价格、上下文和输出上限；thinking effort 转为 Pi 的 `thinkingLevelMap`，不会写入 OMP 专有字段。
 - Provider shadow 状态是 WebView 本地草稿：只针对当前 `omp models --json` 返回的 provider 生效，不从 `disabledProviders` 载入，也不会写回该字段；预设可以保存这份本地 shadow 状态。

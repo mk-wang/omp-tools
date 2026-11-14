@@ -1476,19 +1476,24 @@ async fn fetch_optional_custom_provider_rich_catalog(
     api: &str,
     api_key: &str,
     supported_apis: &[&str],
-) -> Option<Vec<CustomProviderModel>> {
+) -> Result<Option<Vec<CustomProviderModel>>, String> {
     let rich_url = custom_provider_rich_models_url(models_url);
     let response = custom_provider_request(client, &rich_url, api, api_key)
+        .timeout(Duration::from_secs(60))
         .send()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+        .map_err(|error| format!("读取 provider model 列表失败（GET {rich_url}）：{error}"))?;
+    let status = response.status();
+    if matches!(status, reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED) {
+        return Ok(None);
     }
-    let body = response.text().await.ok()?;
-    parse_custom_provider_model_list(&body, supported_apis)
-        .ok()
-        .filter(|models| !models.is_empty())
+    if !status.is_success() {
+        return Err(format!("读取 provider model 列表失败（HTTP {status}）"));
+    }
+    let body = response.text().await
+        .map_err(|error| format!("读取 provider model 响应失败：{error}"))?;
+    let models = parse_custom_provider_model_list(&body, supported_apis)?;
+    Ok((!models.is_empty()).then_some(models))
 }
 
 fn resolve_custom_provider_api_key(raw_key: &str) -> Option<String> {
@@ -1644,14 +1649,29 @@ fn merge_custom_provider_model_capabilities(
     models
 }
 
-fn supports_effort_model_metadata(api: &str) -> bool {
-    matches!(
-        api,
-        "openai-completions"
-            | "openai-responses"
-            | "openai-codex-responses"
-            | "azure-openai-responses"
-    )
+fn model_effort_metadata_mode(api: &str, model_id: &str) -> Option<&'static str> {
+    match api {
+        "openai-completions" | "openai-responses" | "openai-codex-responses"
+        | "azure-openai-responses" => Some("effort"),
+        "anthropic-messages" => {
+            let name = model_id.rsplit('/').next()?.strip_prefix("claude-")?;
+            let (family, revision) = name.split_once('-')?;
+            if !matches!(family, "sonnet" | "opus" | "haiku" | "fable" | "mythos") {
+                return None;
+            }
+            let mut revision = revision.split(['.', '-']);
+            let major = revision.next()?.parse::<u32>().ok()?;
+            // A date suffix on a major-only model is not a minor revision.
+            let minor = revision.next().filter(|part| part.len() <= 2)
+                .and_then(|part| part.parse::<u32>().ok());
+            let adaptive = major >= 5
+                || (matches!(family, "sonnet" | "opus")
+                    && major == 4 && minor.is_some_and(|minor| minor >= 6));
+            // Leave legacy budget models and opaque aliases to OMP's native inference.
+            adaptive.then_some("anthropic-adaptive")
+        }
+        _ => None,
+    }
 }
 /**
  * Custom provider routes do not match OMP's built-in OpenCode provider names;
@@ -1694,9 +1714,9 @@ fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSave
         }
         return;
     }
-    if !supports_effort_model_metadata(model.api.trim()) {
+    let Some(mode) = model_effort_metadata_mode(model.api.trim(), model.id.trim()) else {
         return;
-    }
+    };
     let efforts = model_effort_levels(model);
     if efforts.is_empty() {
         return;
@@ -1706,7 +1726,7 @@ fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSave
     let mut thinking = Mapping::new();
     thinking.insert(
         YamlValue::String("mode".to_string()),
-        YamlValue::String("effort".to_string()),
+        YamlValue::String(mode.to_string()),
     );
     thinking.insert(
         YamlValue::String("efforts".to_string()),
@@ -3022,12 +3042,9 @@ async fn discover_custom_provider_models(
             &api_key,
             supported_apis,
         )
-        .await
+        .await?
         .unwrap_or_default();
-        return Ok(merge_custom_provider_model_capabilities(
-            models,
-            rich_models,
-        ));
+        return Ok(merge_custom_provider_model_capabilities(models, rich_models));
     }
     Err("provider model discovery 没有可用 endpoint".to_string())
 }
@@ -3867,79 +3884,77 @@ mod tests {
     }
 
     #[test]
-    fn custom_provider_discovery_sends_bearer_header() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-        };
+    fn custom_provider_discovery_handles_unavailable_and_failed_rich_catalogs() {
+        use std::{io::{Read, Write}, net::TcpListener};
 
-        let _home_guard = HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = temporary_home();
-        fs::create_dir_all(home.join(".omp").join("agent"))
-            .expect("test agent directory should be created");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("test listener address should exist");
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("discovery request should connect");
-            let mut request_bytes = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 1024];
-                let size = stream.read(&mut chunk).expect("request should be readable");
-                if size == 0 {
-                    break;
+        fs::create_dir_all(home.join(".omp/agent")).unwrap();
+        for (status, rich_body, optional) in [
+            ("404 Not Found", "", true),
+            ("405 Method Not Allowed", "", true),
+            ("503 Service Unavailable", "", false),
+            ("200 OK", "invalid JSON", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                for index in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request_bytes = Vec::new();
+                    loop {
+                        let mut chunk = [0_u8; 1024];
+                        let size = stream.read(&mut chunk).unwrap();
+                        if size == 0 {
+                            break;
+                        }
+                        request_bytes.extend_from_slice(&chunk[..size]);
+                        if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request_bytes).to_ascii_lowercase();
+                    assert!(request.contains("accept: application/json"));
+                    assert!(request.contains("authorization: bearer test-key"));
+                    assert!(request.contains("x-api-key: test-key"));
+                    assert!(request.contains("anthropic-version: 2023-06-01"));
+                    let (status, body) = if index == 0 {
+                        assert!(request.contains("get /v1/models http/1.1"));
+                        ("200 OK", r#"{"data":[{"id":"model-a"},{"id":"model-b"}]}"#)
+                    } else {
+                        assert!(request.contains("get /v1/models?client_version=0.144.1 http/1.1"));
+                        (status, rich_body)
+                    };
+                    write!(stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                    ).unwrap();
                 }
-                request_bytes.extend_from_slice(&chunk[..size]);
-                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
+            });
+            let previous_home = env::var_os("HOME");
+            env::set_var("HOME", &home);
+            let result = tauri::async_runtime::block_on(discover_custom_provider_models(
+                CustomProviderDiscoveryRequest {
+                    provider_id: "test-provider".to_string(),
+                    base_url: format!("http://{address}/v1"),
+                    api: "anthropic-messages".to_string(),
+                    api_key: Some("test-key".to_string()),
+                    target: None,
+                },
+            ));
+            if let Some(previous_home) = previous_home {
+                env::set_var("HOME", previous_home);
+            } else {
+                env::remove_var("HOME");
             }
-            let request = String::from_utf8_lossy(&request_bytes).to_ascii_lowercase();
-            assert!(request.contains("get /v1/models http/1.1"));
-            assert!(request.contains("accept: application/json"));
-            assert!(request.contains("authorization: bearer test-key"));
-            assert!(request.contains("x-api-key: test-key"));
-            assert!(request.contains("anthropic-version: 2023-06-01"));
-            let body = r#"{"data":[{"id":"model-a"},{"id":"model-b"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("test response should be written");
-        });
-
-        let previous_home = env::var_os("HOME");
-        env::set_var("HOME", &home);
-        let result = tauri::async_runtime::block_on(discover_custom_provider_models(
-            CustomProviderDiscoveryRequest {
-                provider_id: "test-provider".to_string(),
-                base_url: format!("http://{address}/v1"),
-                api: "anthropic-messages".to_string(),
-                api_key: Some("test-key".to_string()),
-                target: None,
-            },
-        ));
-        if let Some(previous_home) = previous_home {
-            env::set_var("HOME", previous_home);
-        } else {
-            env::remove_var("HOME");
+            server.join().unwrap();
+            if optional {
+                let models = result.expect("unsupported rich endpoint should retain the ordinary catalog");
+                assert_eq!(models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(), ["model-a", "model-b"]);
+            } else {
+                assert!(result.is_err(), "{status} must not silently discard model metadata");
+            }
         }
-        server.join().expect("discovery server should finish");
-
-        let models = result.expect("discovery should succeed");
-        assert_eq!(
-            models
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["model-a", "model-b"]
-        );
-        fs::remove_dir_all(home).expect("isolated test home should be removed");
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -3978,10 +3993,24 @@ mod tests {
                 assert!(request.contains("authorization: bearer test-key"));
                 let body = if request_index == 0 {
                     assert!(request.contains("get /v1/models http/1.1"));
-                    r#"{"data":[{"id":"model-a","name":"model-a","context_length":240000,"max_output_tokens":32000,"input":["text"],"reasoning":false,"supportsTools":false,"compat":{"supportsStore":false}},{"id":"model-b"}]}"#
+                    let mut body: JsonValue = serde_json::from_str(r#"{"data":[{"id":"model-a","name":"model-a","context_length":240000,"max_output_tokens":32000,"input":["text"],"reasoning":false,"supportsTools":false,"compat":{"supportsStore":false}},{"id":"model-b"}]}"#).unwrap();
+                    for id in ["uni/claude-fable-5.2", "uni/claude-haiku-5.5", "uni/claude-opus-5.5", "uni/claude-sonnet-5.5"] {
+                        body["data"].as_array_mut().unwrap().push(serde_json::json!({"id": id}));
+                    }
+                    body.to_string()
                 } else {
                     assert!(request.contains("get /v1/models?client_version=0.144.1 http/1.1"));
-                    r#"{"models":[{"slug":"model-a","display_name":"Model A","contextWindow":999999,"maxContextWindow":1000000,"cost":{"input":0,"output":2,"cacheRead":0,"cacheWrite":0},"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"ultra"}]}]}"#
+                    // The real rich catalog exceeded the ordinary 15-second discovery deadline.
+                    std::thread::sleep(Duration::from_secs(16));
+                    let mut body: JsonValue = serde_json::from_str(r#"{"models":[{"slug":"model-a","display_name":"Model A","contextWindow":999999,"maxContextWindow":1000000,"cost":{"input":0,"output":2,"cacheRead":0,"cacheWrite":0},"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"ultra"}]}]}"#).unwrap();
+                    for id in ["uni/claude-fable-5.2", "uni/claude-haiku-5.5", "uni/claude-opus-5.5", "uni/claude-sonnet-5.5"] {
+                        body["models"].as_array_mut().unwrap().push(serde_json::json!({
+                            "slug": id, "context_window": 500000, "max_context_window": 872000,
+                            "input_modalities": ["text", "image"], "default_reasoning_level": "medium",
+                            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}]
+                        }));
+                    }
+                    body.to_string()
                 };
                 write!(
                     stream,
@@ -4028,7 +4057,7 @@ mod tests {
         server.join().expect("discovery server should finish");
 
         let (models, written) = result.expect("discovery and save should succeed");
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 6);
         assert_eq!(models[0].id, "model-a");
         assert_eq!(models[0].name, "Model A");
         assert_eq!(models[0].thinking, vec!["low", "high"]);
@@ -4045,7 +4074,117 @@ mod tests {
         assert_eq!(reloaded[0].models[0].configuration["contextWindow"], 240000);
         assert!(!reloaded[0].models[0].configuration.contains_key("compat"));
         assert!(models[1].thinking.is_empty());
+        for saved in written["providers"]["test-provider"]["models"].as_sequence().unwrap().iter().skip(2) {
+            assert_eq!(saved["api"].as_str(), Some("openai-responses"));
+            assert_eq!(saved["contextWindow"].as_u64(), Some(500000));
+            assert_eq!(saved["maxContextWindow"].as_u64(), Some(872000));
+            assert_eq!(saved["input"], serde_yaml::to_value(["text", "image"]).unwrap());
+            assert_eq!(saved["reasoning"].as_bool(), Some(true));
+            assert_eq!(saved["thinking"]["mode"].as_str(), Some("effort"));
+            assert_eq!(saved["thinking"]["efforts"], serde_yaml::to_value(["low", "medium", "high"]).unwrap());
+            assert_eq!(saved["thinking"]["defaultLevel"].as_str(), Some("medium"));
+        }
         fs::remove_dir_all(home).expect("isolated test home should be removed");
+    }
+
+    #[test]
+    fn custom_provider_anthropic_catalog_survives_save_round_trip() {
+        let ids = [
+            "uni/claude-fable-5.2", "uni/claude-haiku-5.5",
+            "uni/claude-opus-5.5", "uni/claude-sonnet-5.5",
+        ];
+        let ordinary = serde_json::json!({
+            "data": ids.iter().map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>()
+        });
+        let rich = serde_json::json!({
+            "models": ids.iter().map(|id| serde_json::json!({
+                "slug": id, "display_name": id, "context_window": 500000,
+                "input_modalities": ["text", "image"], "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}]
+            })).collect::<Vec<_>>()
+        });
+        let models = merge_custom_provider_model_capabilities(
+            parse_custom_provider_model_list(&ordinary.to_string(), &CUSTOM_PROVIDER_APIS).unwrap(),
+            parse_custom_provider_model_list(&rich.to_string(), &CUSTOM_PROVIDER_APIS).unwrap(),
+        );
+        let request: CustomProviderSaveRequest = serde_json::from_value(serde_json::json!({
+            "customProviders": [{
+                "id": "gateway", "baseUrl": "https://example.com/v1",
+                "api": "anthropic-messages", "apiKey": null,
+                "models": models.iter().map(|model| serde_json::json!({
+                    "id": model.id, "api": "anthropic-messages", "thinking": model.thinking,
+                    "defaultThinkingLevel": model.default_thinking_level,
+                    "configuration": model.configuration
+                })).collect::<Vec<_>>()
+            }]
+        })).unwrap();
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let agent = home.join(".omp/agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("models.yml"),
+            "providers:\n  gateway:\n    baseUrl: https://example.com/v1\n    apiKey: test-key\n    models:\n      - id: uni/claude-fable-5.2\n        api: anthropic-messages\n        reasoning: false\n        maxTokens: 64000\n        headers:\n          X-Team: keep\n"
+        ).unwrap();
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+        let result = save_custom_providers(request);
+        if let Some(previous_home) = previous_home {
+            env::set_var("HOME", previous_home);
+        } else {
+            env::remove_var("HOME");
+        }
+        let providers = result.expect("Anthropic catalog should save");
+        let (written, _) = load_models_yaml(&agent.join("models.yml")).unwrap();
+        let saved = written["providers"]["gateway"]["models"].as_sequence().unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            let model = &saved[index];
+            assert_eq!(model["id"].as_str(), Some(*id));
+            assert_eq!(model["api"].as_str(), Some("anthropic-messages"));
+            assert_eq!(model["contextWindow"].as_u64(), Some(500000));
+            assert_eq!(model["input"], serde_yaml::to_value(["text", "image"]).unwrap());
+            assert_eq!(model["reasoning"].as_bool(), Some(index != 0));
+            assert_eq!(model["thinking"]["mode"].as_str(), Some("anthropic-adaptive"));
+            assert_eq!(model["thinking"]["efforts"], serde_yaml::to_value(["low", "medium", "high"]).unwrap());
+            assert_eq!(model["thinking"]["defaultLevel"].as_str(), Some("medium"));
+            assert_eq!(providers[0].models[index].thinking, ["low", "medium", "high"]);
+            assert_eq!(providers[0].models[index].configuration["contextWindow"], 500000);
+            assert!(model["cost"].is_null(), "unadvertised prices must not be invented");
+        }
+        assert_eq!(saved[0]["maxTokens"].as_u64(), Some(64000));
+        assert_eq!(saved[0]["headers"]["X-Team"].as_str(), Some("keep"));
+        assert!(saved[1]["maxTokens"].is_null());
+
+        let mut budget: Mapping = serde_yaml::from_str("reasoning: false\nthinking:\n  mode: budget\n  efforts: [high]\n").unwrap();
+        let mut model = saved_model("uni/claude-sonnet-5.5", "anthropic-messages");
+        model.thinking = vec!["low".to_string(), "high".to_string()];
+        apply_omp_model_capabilities(&mut budget, &model);
+        let budget = YamlValue::Mapping(budget);
+        assert_eq!(budget["thinking"]["mode"].as_str(), Some("budget"));
+        assert_eq!(budget["thinking"]["efforts"], serde_yaml::to_value(["high"]).unwrap());
+        assert_eq!(budget["reasoning"].as_bool(), Some(false));
+        for (api, id, expected) in [
+            ("anthropic-messages", "claude-opus-5.5", Some("anthropic-adaptive")),
+            ("anthropic-messages", "uni/claude-custom", None),
+            ("anthropic-messages", "uni/claude-custom-5", None),
+            ("anthropic-messages", "uni/claude-sonnet-4-6", Some("anthropic-adaptive")),
+            ("anthropic-messages", "uni/claude-opus-4.6", Some("anthropic-adaptive")),
+            ("anthropic-messages", "uni/claude-sonnet-4-5", None),
+            ("anthropic-messages", "uni/claude-haiku-4.5", None),
+            ("anthropic-messages", "uni/claude-opus-4-5", None),
+            ("anthropic-messages", "uni/claude-sonnet-4-20250514", None),
+            ("anthropic-messages", "uni/claude-3-7-sonnet-20250219", None),
+            ("anthropic-messages", "uni/not-claude-opus-5.5", None),
+            ("anthropic-messages", "uni/opus-5.5", None),
+            ("openai-responses", "uni/claude-opus-5.5", Some("effort")),
+            ("google-generative-ai", "uni/claude-opus-5.5", None),
+        ] {
+            let mut config = Mapping::new();
+            let mut model = saved_model(id, api);
+            model.thinking = vec!["low".to_string(), "high".to_string()];
+            apply_omp_model_capabilities(&mut config, &model);
+            assert_eq!(YamlValue::Mapping(config)["thinking"]["mode"].as_str(), expected, "{api}/{id}");
+        }
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn model_catalog_parser_keeps_limits_and_pricing() {

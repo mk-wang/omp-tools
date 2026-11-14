@@ -275,6 +275,11 @@ pub(super) fn discover(value: &Value) -> Result<Configuration, String> {
                 result.insert("contextWindow".to_string(), context.into());
             }
         }
+        if !result.contains_key("maxContextWindow") {
+            if let Some(context) = source.get("max_context_window").and_then(token_limit) {
+                result.insert("maxContextWindow".to_string(), context.into());
+            }
+        }
         if !result.contains_key("maxTokens") {
             let output = source
                 .get("limits")
@@ -350,6 +355,7 @@ mod tests {
         let metadata = discover(&json!({
             "limits": {"max_input_tokens": 200000, "max_output_tokens": 32000},
             "context_length": "invalid", "max_output_tokens": -1,
+            "max_context_window": "872000",
             "input_modalities": ["text", "image"], "reasoning": false,
             "cost": {"input": 0, "output": 1, "cacheRead": 0, "cacheWrite": 0},
             "object": "model", "created": 1
@@ -357,6 +363,7 @@ mod tests {
         .unwrap();
         assert_eq!(metadata["contextWindow"], 232000);
         assert_eq!(metadata["maxTokens"], 32000);
+        assert_eq!(metadata["maxContextWindow"], 872000);
         assert_eq!(metadata["input"], json!(["text", "image"]));
         assert_eq!(metadata["reasoning"], false);
         assert_eq!(metadata["cost"]["input"], 0);
@@ -368,10 +375,12 @@ mod tests {
             discover(&json!({"context_length": " 200000 ", "max_output_tokens": "32000"})).unwrap();
         assert_eq!(strings["contextWindow"], 200000);
         assert_eq!(strings["maxTokens"], 32000);
+        assert_eq!(discover(&json!({"maxContextWindow": 1000000, "max_context_window": 872000})).unwrap()["maxContextWindow"], 1000000);
         assert!(validate(json!({"api": "openai-responses"}).as_object().unwrap()).is_err());
         for invalid in [
             json!({"contextWindow": "huge"}),
             json!({"contextWindow": 200, "maxContextWindow": 100}),
+            json!({"context_window": 500000, "max_context_window": 400000}),
             json!({"imageCountBudget": 0}),
             json!({"reasoning": "false"}),
             json!({"contextWindow": 0}),
