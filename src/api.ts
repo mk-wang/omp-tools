@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ConfigSnapshot,
-  CustomProvider,
+  CustomProviderStore,
   CustomProviderDiscoveryRequest,
   CustomProviderModel,
   CustomProviderSaveRequest,
@@ -17,8 +17,8 @@ export function saveSnapshot(request: SaveRequest): Promise<ConfigSnapshot> {
 
 export function saveCustomProviders(
   request: CustomProviderSaveRequest
-): Promise<CustomProvider[]> {
-  return invoke<CustomProvider[]>("save_custom_providers", { request });
+): Promise<CustomProviderStore> {
+  return invoke<CustomProviderStore>("save_custom_providers", { request });
 }
 
 export function discoverCustomProviderModels(

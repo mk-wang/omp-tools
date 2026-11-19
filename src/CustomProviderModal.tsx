@@ -2,6 +2,7 @@ import type { CustomProviderModel, JsonObject, JsonValue } from "./types";
 
 export type CustomProviderEditor = {
   mode: "create" | "edit";
+  storeVersion: string;
   originalId: string;
   id: string;
   baseUrl: string;
@@ -45,13 +46,6 @@ export const CUSTOM_PROVIDER_API_OPTIONS: readonly CustomProviderApiOption[] = [
   { value: "openrouter-rerank", label: "OpenRouter Rerank" },
   { value: "openrouter-video", label: "OpenRouter Video" },
   { value: "openai-transcriptions", label: "OpenAI Transcriptions" }
-];
-
-export const PI_CUSTOM_PROVIDER_API_OPTIONS: readonly CustomProviderApiOption[] = [
-  { value: "openai-completions", label: "OpenAI Completions" },
-  { value: "openai-responses", label: "OpenAI Responses" },
-  { value: "anthropic-messages", label: "Anthropic Messages" },
-  { value: "google-generative-ai", label: "Google Generative AI" }
 ];
 
 export function sortedCustomProviderModels(models: CustomProviderModel[]): CustomProviderModel[] {
@@ -111,7 +105,8 @@ export function mergeDiscoveredModels(
     // Serde omits empty optional fields, so an absent key means "unchanged", not "cleared".
     const thinking = model.thinking ?? known.thinking;
     const defaultThinkingLevel = model.defaultThinkingLevel ?? known.defaultThinkingLevel;
-    const api = model.api || known.api;
+    // A catalog describes capabilities; it cannot change a saved transport choice.
+    const api = known.api || model.api;
     return {
       ...model,
       ...(thinking ? { thinking } : {}),
@@ -130,8 +125,8 @@ export function customProviderApiOverrides(
 ): Record<string, string> {
   return Object.fromEntries(
     models.flatMap(model => {
-      const api = model.api?.trim();
-      return api && api !== defaultApi ? [[model.id, api] as const] : [];
+      const api = model.api?.trim() || defaultApi.trim();
+      return api ? [[model.id, api] as const] : [];
     })
   );
 }
@@ -144,10 +139,6 @@ export function customProviderApiOverride(overrides: Record<string, string>, mod
 export function CustomProviderModal({
   editor,
   existingProviderIds,
-  apiOptions,
-  productName,
-  destinationPath,
-  requireApiKey,
   discovering,
   discoveryError,
   saving,
@@ -159,10 +150,6 @@ export function CustomProviderModal({
 }: {
   editor: CustomProviderEditor;
   existingProviderIds: string[];
-  apiOptions: readonly CustomProviderApiOption[];
-  productName: string;
-  destinationPath: string;
-  requireApiKey: boolean;
   discovering: boolean;
   discoveryError: string;
   saving: boolean;
@@ -186,16 +173,16 @@ export function CustomProviderModal({
     : !/^https?:\/\/\S+$/i.test(editor.baseUrl.trim())
       ? "Base URL 必须以 http:// 或 https:// 开头。"
       : "";
-  const apiError = apiOptions.some(option => option.value === editor.api)
+  const apiError = CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === editor.api)
     ? ""
-    : `请选择 ${productName} 支持的 Type。`;
+    : "请选择 OMP 支持的 Type。";
   const modelApiError = editor.models.some(modelId => {
     const api = customProviderApiOverride(editor.modelApiOverrides, modelId).trim() || editor.api;
-    return !apiOptions.some(option => option.value === api);
+    return !CUSTOM_PROVIDER_API_OPTIONS.some(option => option.value === api);
   })
     ? "请选择每个 model 支持的 Type。"
     : "";
-  const keyError = requireApiKey && !editor.apiKey.trim() && !editor.apiKeyConfigured && !editor.authNone
+  const keyError = !editor.apiKey.trim() && !editor.apiKeyConfigured && !editor.authNone
     ? "请输入 API key。"
     : "";
   const modelError = editor.availableModels.length === 0
@@ -225,8 +212,8 @@ export function CustomProviderModal({
 
   const updateModelApi = (modelId: string, api: string) => {
     const modelApiOverrides = { ...editor.modelApiOverrides };
-    if (api) Object.defineProperty(modelApiOverrides, modelId, { value: api, enumerable: true, writable: true, configurable: true });
-    else delete modelApiOverrides[modelId];
+    // An empty own entry explicitly selects the default and must survive a refresh.
+    Object.defineProperty(modelApiOverrides, modelId, { value: api, enumerable: true, writable: true, configurable: true });
     onChange({ ...editor, modelApiOverrides });
   };
 
@@ -242,7 +229,7 @@ export function CustomProviderModal({
         <div className="role-modal-header">
           <div>
             <span className="section-kicker">CUSTOM PROVIDER</span>
-            <h2 id="custom-provider-title">{editor.mode === "create" ? `新增 ${productName} Custom Provider` : `编辑 ${editor.id}`}</h2>
+            <h2 id="custom-provider-title">{editor.mode === "create" ? "新增 OMP Custom Provider" : `编辑 ${editor.id}`}</h2>
           </div>
           <button className="modal-close" onClick={onCancel} aria-label="关闭">×</button>
         </div>
@@ -268,7 +255,7 @@ export function CustomProviderModal({
                 onChange={event => onChange({ ...editor, api: event.target.value, availableModels: [], discoveredModelIds: null })}
               >
                 <option value="">选择 API type…</option>
-                {apiOptions.map(option => (
+                {CUSTOM_PROVIDER_API_OPTIONS.map(option => (
                   <option value={option.value} key={option.value}>{option.label}</option>
                 ))}
               </select>
@@ -289,7 +276,7 @@ export function CustomProviderModal({
               type="password"
               value={editor.apiKey}
               onChange={event => onChange({ ...editor, apiKey: event.target.value, availableModels: [], discoveredModelIds: null })}
-              placeholder={editor.apiKeyConfigured ? "已配置；留空保持不变" : requireApiKey ? "输入 API key" : "可留空，使用 Pi auth.json 或环境变量"}
+              placeholder={editor.apiKeyConfigured ? "已配置；留空保持不变" : "输入 API key"}
               autoComplete="new-password"
               spellCheck={false}
             />
@@ -349,7 +336,7 @@ export function CustomProviderModal({
                       aria-label={`${model.id} API type`}
                     >
                       <option value="">跟随总 Type（{editor.api || "未设置"}）</option>
-                      {apiOptions.map(option => (
+                      {CUSTOM_PROVIDER_API_OPTIONS.map(option => (
                         <option value={option.value} key={option.value}>{option.label}</option>
                       ))}
                     </select>
@@ -364,7 +351,7 @@ export function CustomProviderModal({
           {discoveryError && <div className="modal-validation is-error">{discoveryError}</div>}
           {saveError && <div className="modal-validation is-error">{saveError}</div>}
           <div className={`modal-validation${error ? " is-error" : ""}`}>
-            {error || `将立即写入 ${destinationPath}；不影响窗口右上角的 Apply。`}
+            {error || "将立即写入 ~/.omp/agent/models.yml；不影响窗口右上角的 Apply。"}
           </div>
         </div>
         <div className="role-modal-footer">

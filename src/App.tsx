@@ -1736,7 +1736,7 @@ function AgentModal({
   );
 }
 
-export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
+export default function App() {
   const [snapshot, setSnapshot] = useState<ConfigSnapshot | null>(null);
   const [values, setValues] = useState<SlotValues>(EMPTY_VALUES);
   const [customRoles, setCustomRoles] = useState<CustomRole[]>([]);
@@ -1750,6 +1750,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   const [securityReviewerFollowsSlow, setSecurityReviewerFollowsSlow] = useState(true);
   const [shadowedProviders, setShadowedProviders] = useState<string[]>([]);
   const [customProviders, setCustomProviders] = useState<CustomProvider[]>([]);
+  const [customProvidersVersion, setCustomProvidersVersion] = useState("");
   const [customProviderEditor, setCustomProviderEditor] = useState<CustomProviderEditor | null>(null);
   const [customProviderModelLoading, setCustomProviderModelLoading] = useState(false);
   const [customProviderModelError, setCustomProviderModelError] = useState("");
@@ -1831,6 +1832,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setPendingDeleteCustomRole("");
     setAgentEditor(null);
     setCustomProviders(next.customProviders);
+    setCustomProvidersVersion(next.customProvidersVersion);
     setCustomProviderEditor(null);
     setCustomProviderModelLoading(false);
     setCustomProviderModelError("");
@@ -2156,6 +2158,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     setCustomProviderModelLoading(false);
     setCustomProviderEditor({
       mode: "create",
+      storeVersion: customProvidersVersion,
       originalId: "",
       id: "",
       baseUrl: "",
@@ -2228,12 +2231,14 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
   const persistCustomProviders = async (
     providers: CustomProvider[],
     removedProviderIds: string[],
-    updatedApiKey?: { id: string; value: string }
+    updatedApiKey?: { id: string; value: string },
+    expectedVersion = customProvidersVersion
   ): Promise<boolean> => {
     setCustomProviderSaving(true);
     setCustomProviderSaveError("");
     try {
-      const savedProviders = await saveCustomProviders({
+      const savedStore = await saveCustomProviders({
+        expectedVersion,
         customProviders: providers.map(provider => ({
           id: provider.id,
           baseUrl: provider.baseUrl,
@@ -2249,8 +2254,11 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
         })),
         removedCustomProviders: removedProviderIds
       });
-      setCustomProviders(savedProviders);
-      setSnapshot(current => current ? { ...current, customProviders: savedProviders } : current);
+      setCustomProviders(savedStore.customProviders);
+      setCustomProvidersVersion(savedStore.version);
+      setSnapshot(current => current ? {
+        ...current, customProviders: savedStore.customProviders, customProvidersVersion: savedStore.version
+      } : current);
       await refresh();
       return true;
     } catch (saveError) {
@@ -2276,6 +2284,7 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     );
     setCustomProviderEditor({
       mode: "edit",
+      storeVersion: customProvidersVersion,
       originalId: provider.id,
       id: provider.id,
       baseUrl: provider.baseUrl,
@@ -2352,7 +2361,8 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
     const saved = await persistCustomProviders(
       nextProviders,
       [],
-      apiKey ? { id, value: apiKey } : undefined
+      apiKey ? { id, value: apiKey } : undefined,
+      editor.storeVersion
     );
     if (!saved) return;
     setPendingDeleteCustomProvider("");
@@ -2695,10 +2705,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
           </div>
         </div>
         <div className="header-actions">
-          <div className="tool-switcher">
-            <button className="tool-tab is-active">OMP</button>
-            <button className="tool-tab" onClick={onSwitchTool}>Pi</button>
-          </div>
           <div className="config-status">
             <span className="status-dot" />
             {snapshot?.configPath ?? "~/.omp/agent/config.yml"}
@@ -3124,10 +3130,6 @@ export default function App({ onSwitchTool }: { onSwitchTool: () => void }) {
       </div>
       {customProviderEditor && (
         <CustomProviderModal
-          apiOptions={CUSTOM_PROVIDER_API_OPTIONS}
-          productName="OMP"
-          destinationPath="~/.omp/agent/models.yml"
-          requireApiKey
           editor={customProviderEditor}
           existingProviderIds={customProviders.map(provider => provider.id)}
           discovering={customProviderModelLoading}

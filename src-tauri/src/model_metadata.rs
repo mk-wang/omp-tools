@@ -332,19 +332,6 @@ pub(super) fn discover(value: &Value) -> Result<Configuration, String> {
     Ok(result)
 }
 
-pub(super) fn for_pi(configuration: &Configuration) -> Configuration {
-    configuration
-        .iter()
-        .filter(|(key, _)| {
-            matches!(
-                key.as_str(),
-                "name" | "reasoning" | "input" | "cost" | "contextWindow" | "maxTokens"
-            )
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

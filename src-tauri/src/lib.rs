@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value as YamlValue};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{hash_map::RandomState, BTreeMap, HashMap, HashSet},
     env, fs,
+    hash::BuildHasher,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -50,12 +52,6 @@ const CUSTOM_PROVIDER_APIS: [&str; 21] = [
     "openrouter-rerank",
     "openrouter-video",
     "openai-transcriptions",
-];
-const PI_CUSTOM_PROVIDER_APIS: [&str; 4] = [
-    "openai-completions",
-    "openai-responses",
-    "anthropic-messages",
-    "google-generative-ai",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,13 +136,18 @@ struct CustomProviderSave {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CustomProviderSaveRequest {
+    expected_version: String,
     #[serde(default)]
     custom_providers: Vec<CustomProviderSave>,
     #[serde(default)]
     removed_custom_providers: Vec<String>,
-    /// `omp` is the legacy/default store; `pi` targets ~/.pi/agent/models.json.
-    #[serde(default)]
-    target: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomProviderStore {
+    custom_providers: Vec<CustomProvider>,
+    version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,9 +158,6 @@ struct CustomProviderDiscoveryRequest {
     api: String,
     #[serde(default)]
     api_key: Option<String>,
-    /// `omp` is the legacy/default store; `pi` reads existing keys from models.json.
-    #[serde(default)]
-    target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +206,7 @@ struct ConfigSnapshot {
     agent_files: Vec<AgentDefinitionFile>,
     routing_settings: RoutingSettings,
     custom_providers: Vec<CustomProvider>,
+    custom_providers_version: String,
     warnings: Vec<String>,
 }
 
@@ -546,14 +545,6 @@ fn yaml_model_api(value: &YamlValue) -> Option<String> {
         .and_then(|api| (!api.trim().is_empty()).then_some(api.trim().to_string()))
 }
 
-fn json_model_api(value: &JsonValue) -> Option<String> {
-    value
-        .as_object()
-        .and_then(|object| object.get("api"))
-        .and_then(JsonValue::as_str)
-        .and_then(|api| (!api.trim().is_empty()).then_some(api.trim().to_string()))
-}
-
 fn inferred_custom_provider_api(
     provider_api: Option<String>,
     models: &[CustomProviderModel],
@@ -800,83 +791,6 @@ fn json_model_id(value: &JsonValue) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-fn custom_provider_models_json(value: Option<&JsonValue>) -> Vec<CustomProviderModel> {
-    let Some(JsonValue::Array(values)) = value else {
-        return Vec::new();
-    };
-    let mut seen = HashSet::new();
-    let mut models = values
-        .iter()
-        .filter_map(|value| {
-            let id = json_model_id(value)?;
-            if !seen.insert(id.clone()) {
-                return None;
-            }
-            let name = value
-                .as_object()
-                .and_then(|object| {
-                    ["name", "display_name", "displayName"]
-                        .iter()
-                        .find_map(|key| object.get(*key).and_then(JsonValue::as_str))
-                })
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or(&id)
-                .to_string();
-            Some(CustomProviderModel {
-                id,
-                name,
-                api: json_model_api(value),
-                thinking: json_model_thinking_levels(value),
-                default_thinking_level: json_model_default_thinking_level(value),
-                configuration: model_metadata::snapshot(value),
-            })
-        })
-        .collect::<Vec<_>>();
-    models.sort_by(|left, right| left.id.cmp(&right.id));
-    models
-}
-
-fn load_pi_custom_providers(root: &serde_json::Map<String, JsonValue>) -> Vec<CustomProvider> {
-    let Some(providers) = root.get("providers").and_then(JsonValue::as_object) else {
-        return Vec::new();
-    };
-
-    let mut result = providers
-        .iter()
-        .filter_map(|(id, value)| {
-            let id = id.trim();
-            let config = value.as_object()?;
-            let models = custom_provider_models_json(config.get("models"));
-            if models.is_empty() {
-                return None;
-            }
-            let provider_api = config
-                .get("api")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
-            Some(CustomProvider {
-                id: id.to_string(),
-                base_url: config
-                    .get("baseUrl")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                api: inferred_custom_provider_api(provider_api, &models),
-                api_key_configured: config
-                    .get("apiKey")
-                    .and_then(JsonValue::as_str)
-                    .is_some_and(|key| !key.trim().is_empty()),
-                // Pi's models.json has no OMP `auth: none` field. Authentication may
-                // still come from auth.json or the environment, so this remains false.
-                auth_none: false,
-                models,
-            })
-        })
-        .collect::<Vec<_>>();
-    result.sort_by(|left, right| left.id.cmp(&right.id));
-    result
-}
-
 fn ensure_mapping(value: &mut YamlValue) -> &mut Mapping {
     if !matches!(value, YamlValue::Mapping(_)) {
         *value = YamlValue::Mapping(Mapping::new());
@@ -1003,12 +917,10 @@ fn existing_custom_provider<'a>(root: &'a YamlValue, id: &str) -> Option<&'a Yam
 fn validate_custom_provider_models(
     provider_id: &str,
     models: &[CustomProviderSaveModel],
-    supported_apis: &[&str],
-    product_label: &str,
 ) -> Result<(), String> {
     if models.is_empty() {
         return Err(format!(
-            "{product_label} custom provider “{provider_id}”至少需要一个 model"
+            "OMP custom provider “{provider_id}”至少需要一个 model"
         ));
     }
 
@@ -1017,22 +929,22 @@ fn validate_custom_provider_models(
         let model_id = model.id.trim();
         if model_id.is_empty() {
             return Err(format!(
-                "{product_label} custom provider “{provider_id}”包含空 model"
+                "OMP custom provider “{provider_id}”包含空 model"
             ));
         }
         if !seen_models.insert(model_id.to_string()) {
             return Err(format!(
-                "{product_label} custom provider “{provider_id}”的 model “{model_id}”重复"
+                "OMP custom provider “{provider_id}”的 model “{model_id}”重复"
             ));
         }
         let api = model.api.trim();
-        if !supported_apis.contains(&api) {
+        if !CUSTOM_PROVIDER_APIS.contains(&api) {
             return Err(format!(
-                "{product_label} custom provider “{provider_id}”的 model “{model_id}” Type “{api}”不受支持"
+                "OMP custom provider “{provider_id}”的 model “{model_id}” Type “{api}”不受支持"
             ));
         }
         model_metadata::validate(&model.configuration)
-            .map_err(|error| format!("{product_label} model “{model_id}”：{error}"))?;
+            .map_err(|error| format!("OMP model “{model_id}”：{error}"))?;
     }
     Ok(())
 }
@@ -1065,7 +977,7 @@ fn validate_custom_providers(
                 "Custom provider “{id}”的 Type “{api}”不受 OMP 支持"
             ));
         }
-        validate_custom_provider_models(id, &provider.models, &CUSTOM_PROVIDER_APIS, "OMP")?;
+        validate_custom_provider_models(id, &provider.models)?;
 
         let existing = existing_custom_provider(root, id).and_then(YamlValue::as_mapping);
         let existing_models = existing
@@ -1241,148 +1153,6 @@ fn set_custom_providers(
     set_nested_value(root, &["providers"], value);
 }
 
-fn existing_pi_custom_provider<'a>(
-    root: &'a serde_json::Map<String, JsonValue>,
-    id: &str,
-) -> Option<&'a JsonValue> {
-    root.get("providers")
-        .and_then(JsonValue::as_object)
-        .and_then(|providers| providers.get(id))
-}
-
-fn validate_pi_custom_providers(providers: &[CustomProviderSave]) -> Result<(), String> {
-    let mut seen_providers = HashSet::new();
-    for provider in providers {
-        let id = provider.id.trim();
-        if !valid_custom_provider_id(id) {
-            return Err(format!(
-                "Pi custom provider “{id}”无效：只能包含字母、数字、-、_、.，且必须以字母或数字开头"
-            ));
-        }
-        if !seen_providers.insert(id.to_string()) {
-            return Err(format!("Pi custom provider “{id}”重复"));
-        }
-
-        let base_url = provider.base_url.trim();
-        if !valid_custom_provider_base_url(base_url) {
-            return Err(format!(
-                "Pi custom provider “{id}”的 Base URL 必须以 http:// 或 https:// 开头"
-            ));
-        }
-        let api = provider.api.trim();
-        if !PI_CUSTOM_PROVIDER_APIS.contains(&api) {
-            return Err(format!(
-                "Pi custom provider “{id}”的 Type “{api}”不受 Pi 支持"
-            ));
-        }
-        validate_custom_provider_models(id, &provider.models, &PI_CUSTOM_PROVIDER_APIS, "Pi")?;
-
-        if provider
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(str::is_empty)
-        {
-            return Err(format!("Pi custom provider “{id}”的 API key 不能为空"));
-        }
-    }
-    Ok(())
-}
-
-fn custom_provider_json(existing: Option<&JsonValue>, provider: &CustomProviderSave) -> JsonValue {
-    let mut config = existing
-        .and_then(JsonValue::as_object)
-        .cloned()
-        .unwrap_or_default();
-    config.insert(
-        "baseUrl".to_string(),
-        JsonValue::String(provider.base_url.trim().to_string()),
-    );
-    config.remove("api");
-
-    if let Some(api_key) = provider
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-    {
-        config.insert("apiKey".to_string(), JsonValue::String(api_key.to_string()));
-    }
-
-    let model_apis = provider
-        .models
-        .iter()
-        .map(|model| (model.id.trim(), model.api.trim()))
-        .collect::<BTreeMap<_, _>>();
-    let model_metadata = provider
-        .models
-        .iter()
-        .map(|model| (model.id.trim(), model))
-        .collect::<BTreeMap<_, _>>();
-    let selected_models = model_apis.keys().copied().collect::<HashSet<_>>();
-    let mut retained_models = Vec::new();
-    let mut retained_ids = HashSet::new();
-    if let Some(existing_models) = config.get("models").and_then(JsonValue::as_array) {
-        for model in existing_models {
-            let Some(id) = json_model_id(model) else {
-                continue;
-            };
-            let Some(api) = model_apis.get(id.as_str()) else {
-                continue;
-            };
-            if selected_models.contains(id.as_str()) && retained_ids.insert(id.clone()) {
-                let mut model_config = model.as_object().cloned().unwrap_or_default();
-                model_config.insert("id".to_string(), JsonValue::String(id.clone()));
-                model_config.insert("api".to_string(), JsonValue::String((*api).to_string()));
-                if let Some(metadata) = model_metadata.get(id.as_str()) {
-                    apply_pi_model_capabilities(&mut model_config, metadata);
-                }
-                retained_models.push(JsonValue::Object(model_config));
-            }
-        }
-    }
-    for model in &provider.models {
-        let id = model.id.trim();
-        if retained_ids.insert(id.to_string()) {
-            let mut model_value = serde_json::Map::new();
-            model_value.insert("id".to_string(), JsonValue::String(id.to_string()));
-            model_value.insert(
-                "api".to_string(),
-                JsonValue::String(model.api.trim().to_string()),
-            );
-            apply_pi_model_capabilities(&mut model_value, model);
-            retained_models.push(JsonValue::Object(model_value));
-        }
-    }
-    retained_models.sort_by(|left, right| json_model_id(left).cmp(&json_model_id(right)));
-    config.insert("models".to_string(), JsonValue::Array(retained_models));
-    JsonValue::Object(config)
-}
-
-fn set_pi_custom_providers(
-    root: &mut serde_json::Map<String, JsonValue>,
-    providers: &[CustomProviderSave],
-    removed: &[String],
-) {
-    let mut next = root
-        .get("providers")
-        .and_then(JsonValue::as_object)
-        .cloned()
-        .unwrap_or_default();
-    for provider in removed {
-        next.remove(provider.trim());
-    }
-    for provider in providers {
-        let id = provider.id.trim();
-        let existing = next.get(id).cloned();
-        next.insert(
-            id.to_string(),
-            custom_provider_json(existing.as_ref(), provider),
-        );
-    }
-    root.insert("providers".to_string(), JsonValue::Object(next));
-}
-
 fn model_from_parts(
     provider: String,
     id: String,
@@ -1547,7 +1317,6 @@ fn discovery_client(
 async fn fetch_optional_custom_provider_rich_catalog(
     client: &reqwest::Client,
     models_url: &str,
-    supported_apis: &[&str],
 ) -> Result<Option<Vec<CustomProviderModel>>, String> {
     let rich_url = custom_provider_rich_models_url(models_url);
     let response = client.get(&rich_url)
@@ -1564,7 +1333,7 @@ async fn fetch_optional_custom_provider_rich_catalog(
     }
     let body = response.text().await
         .map_err(|error| format!("读取 provider model 响应失败：{error}"))?;
-    let models = parse_custom_provider_model_list(&body, supported_apis)?;
+    let models = parse_custom_provider_model_list(&body)?;
     Ok((!models.is_empty()).then_some(models))
 }
 
@@ -1576,16 +1345,13 @@ fn resolve_custom_provider_api_key(raw_key: &str) -> Option<String> {
     let resolved = env::var(raw_key).unwrap_or_else(|_| raw_key.to_string());
     (!resolved.trim().is_empty()).then(|| resolved.trim().to_string())
 }
-fn discovered_custom_provider_model_api(
-    value: &JsonValue,
-    supported_apis: &[&str],
-) -> Option<String> {
+fn discovered_custom_provider_model_api(value: &JsonValue) -> Option<String> {
     let object = value.as_object()?;
     if let Some(api) = object
         .get("api")
         .and_then(JsonValue::as_str)
         .map(str::trim)
-        .filter(|api| supported_apis.contains(api))
+        .filter(|api| CUSTOM_PROVIDER_APIS.contains(api))
     {
         return Some(api.to_string());
     }
@@ -1615,14 +1381,11 @@ fn discovered_custom_provider_model_api(
     } else {
         return None;
     };
-    supported_apis
-        .contains(&candidate)
-        .then(|| candidate.to_string())
+    Some(candidate.to_string())
 }
 
 fn parse_custom_provider_model_list(
     content: &str,
-    supported_apis: &[&str],
 ) -> Result<Vec<CustomProviderModel>, String> {
     let document: JsonValue = serde_json::from_str(content)
         .map_err(|error| format!("provider model 列表不是有效 JSON: {error}"))?;
@@ -1648,7 +1411,7 @@ fn parse_custom_provider_model_list(
                     .unwrap_or(&id)
                     .trim()
                     .to_string();
-                let api = discovered_custom_provider_model_api(value, supported_apis);
+                let api = discovered_custom_provider_model_api(value);
                 (id, name, api)
             }
             _ => continue,
@@ -1819,36 +1582,6 @@ fn apply_omp_model_capabilities(config: &mut Mapping, model: &CustomProviderSave
         YamlValue::String("thinking".to_string()),
         YamlValue::Mapping(thinking),
     );
-}
-
-fn apply_pi_model_capabilities(
-    config: &mut serde_json::Map<String, JsonValue>,
-    model: &CustomProviderSaveModel,
-) {
-    model_metadata::merge(config, &model_metadata::for_pi(&model.configuration));
-    let levels = normalize_custom_provider_thinking_levels(&model.thinking);
-    if levels.is_empty() {
-        return;
-    }
-    config.entry("reasoning".to_string()).or_insert(JsonValue::Bool(true));
-    let present = levels.iter().cloned().collect::<HashSet<_>>();
-    let mut level_map = config
-        .get("thinkingLevelMap")
-        .and_then(JsonValue::as_object)
-        .cloned()
-        .unwrap_or_default();
-    for level in THINKING_LEVELS {
-        if level == "off" {
-            if present.contains(level) {
-                level_map.insert(level.to_string(), JsonValue::String("none".to_string()));
-            }
-        } else if present.contains(level) {
-            level_map.insert(level.to_string(), JsonValue::String(level.to_string()));
-        } else {
-            level_map.insert(level.to_string(), JsonValue::Null);
-        }
-    }
-    config.insert("thinkingLevelMap".to_string(), JsonValue::Object(level_map));
 }
 
 fn parse_models_json(content: &str, read_kind: bool) -> Result<Vec<ModelOption>, String> {
@@ -2249,6 +1982,7 @@ fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapsh
         agent_files,
         routing_settings,
         custom_providers: load_custom_providers(&models_root),
+        custom_providers_version: omp_models_version(&models_root)?,
         warnings,
     })
 }
@@ -2256,19 +1990,7 @@ fn load_snapshot_from_disk(custom_omp_path: Option<&str>) -> Result<ConfigSnapsh
 fn write_yaml_atomically(path: &Path, value: &YamlValue) -> Result<(), String> {
     let content = serde_yaml::to_string(value)
         .map_err(|error| format!("生成 {} 失败: {error}", display_path(path)))?;
-    fs::create_dir_all(
-        path.parent()
-            .ok_or_else(|| "无法确定配置目录".to_string())?,
-    )
-    .map_err(|error| format!("创建配置目录失败: {error}"))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.yml");
-    let temporary = path.with_file_name(format!(".{file_name}.omp-model-studio.tmp"));
-    fs::write(&temporary, content).map_err(|error| format!("写入临时配置失败: {error}"))?;
-    fs::rename(&temporary, path).map_err(|error| format!("替换配置文件失败: {error}"))?;
-    Ok(())
+    write_text_atomically(path, &content)
 }
 
 fn valid_agent_file_name(file_name: &str) -> bool {
@@ -2281,30 +2003,17 @@ fn valid_agent_file_name(file_name: &str) -> bool {
 fn write_text_atomically(path: &Path, content: &str) -> Result<(), String> {
     fs::create_dir_all(
         path.parent()
-            .ok_or_else(|| "无法确定 Agent 配置目录".to_string())?,
+            .ok_or_else(|| "无法确定配置目录".to_string())?,
     )
-    .map_err(|error| format!("创建 Agent 配置目录失败: {error}"))?;
+    .map_err(|error| format!("创建配置目录失败: {error}"))?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "Agent Markdown 文件名无效".to_string())?;
+        .ok_or_else(|| "配置文件名无效".to_string())?;
     let temporary = path.with_file_name(format!(".{file_name}.omp-model-studio.tmp"));
-    fs::write(&temporary, content)
-        .map_err(|error| format!("写入 Agent Markdown 临时文件失败: {error}"))?;
-    fs::rename(&temporary, path).map_err(|error| format!("替换 Agent Markdown 失败: {error}"))?;
+    fs::write(&temporary, content).map_err(|error| format!("写入临时配置失败: {error}"))?;
+    fs::rename(&temporary, path).map_err(|error| format!("替换配置文件失败: {error}"))?;
     Ok(())
-}
-
-fn selector_provider(selector: &str) -> Option<&str> {
-    let trimmed = selector.trim();
-    if trimmed.is_empty() || trimmed.starts_with('@') {
-        return None;
-    }
-    let base = trimmed
-        .rsplit_once(':')
-        .filter(|(_, suffix)| THINKING_LEVELS.contains(suffix))
-        .map_or(trimmed, |(base, _)| base);
-    base.split_once('/').map(|(provider, _)| provider)
 }
 
 fn validate_routing_settings(settings: &RoutingSettings) -> Result<(), String> {
@@ -2358,686 +2067,17 @@ fn validate_routing_settings(settings: &RoutingSettings) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PiModelOption {
-    provider: String,
-    id: String,
-    selector: String,
-    context_window: Option<u64>,
-    max_tokens: Option<u64>,
-    reasoning: bool,
-    images: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    thinking: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    default_thinking_level: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct PiTier {
-    /// Complete `provider/model-id:thinking` spec for the primary attempt.
-    model: String,
-    #[serde(default)]
-    /// Complete model specs tried after the primary, each with its own thinking suffix.
-    fallback_models: Vec<String>,
-}
-
-fn default_max_recursion_depth() -> i64 {
-    2
-}
-
-/// Studio's UI-facing model tier shape. The persisted pi-roster block uses
-/// `defaultModelProfile` and `modelProfiles`; conversion helpers below keep
-/// that external contract at the settings boundary while preserving the
-/// existing Tier-oriented UI model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PiTiersFile {
-    #[serde(default)]
-    default: String,
-    #[serde(default)]
-    tiers: BTreeMap<String, PiTier>,
-    #[serde(default)]
-    assignments: BTreeMap<String, Vec<String>>,
-    /// Agent names pi-roster must never dispatch to, regardless of tier
-    /// assignment. Unlike pi-subagents' `disableBuiltins`, pi-roster ships no
-    /// bundled personas, so there is nothing else to "turn off defaults" for.
-    #[serde(default)]
-    disabled_agents: Vec<String>,
-    /// Negative means unlimited, matching oh-my-pi's own semantics that
-    /// pi-roster's spawn-depth guard is ported from.
-    #[serde(default = "default_max_recursion_depth")]
-    max_recursion_depth: i64,
-}
-
-impl Default for PiTiersFile {
-    fn default() -> Self {
-        Self {
-            default: String::new(),
-            tiers: BTreeMap::new(),
-            assignments: BTreeMap::new(),
-            disabled_agents: Vec::new(),
-            max_recursion_depth: default_max_recursion_depth(),
-        }
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PiRosterProfile {
-    model: String,
-    #[serde(default)]
-    fallback_models: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PiRosterConfig {
-    #[serde(default)]
-    default_model_profile: String,
-    #[serde(default)]
-    model_profiles: BTreeMap<String, PiRosterProfile>,
-    #[serde(default)]
-    assignments: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    disabled_agents: Vec<String>,
-    #[serde(default = "default_max_recursion_depth")]
-    max_recursion_depth: i64,
-}
-
-fn pi_roster_config_to_pi_tiers(config: PiRosterConfig) -> PiTiersFile {
-    let tiers = config
-        .model_profiles
-        .into_iter()
-        .map(|(name, profile)| {
-            (
-                name,
-                PiTier {
-                    model: profile.model,
-                    fallback_models: profile.fallback_models,
-                },
-            )
-        })
-        .collect();
-    PiTiersFile {
-        default: config.default_model_profile,
-        tiers,
-        assignments: config.assignments,
-        disabled_agents: config.disabled_agents,
-        max_recursion_depth: config.max_recursion_depth,
-    }
-}
-
-fn pi_tiers_to_roster_config(tiers: &PiTiersFile) -> PiRosterConfig {
-    let model_profiles = tiers
-        .tiers
-        .iter()
-        .map(|(name, tier)| {
-            (
-                name.clone(),
-                PiRosterProfile {
-                    model: tier.model.clone(),
-                    fallback_models: tier.fallback_models.clone(),
-                },
-            )
-        })
-        .collect();
-    PiRosterConfig {
-        default_model_profile: tiers.default.clone(),
-        model_profiles,
-        assignments: tiers.assignments.clone(),
-        disabled_agents: tiers.disabled_agents.clone(),
-        max_recursion_depth: tiers.max_recursion_depth,
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PiSnapshot {
-    settings_path: String,
-    roster_config_exists: bool,
-    tiers: PiTiersFile,
-    models: Vec<PiModelOption>,
-    custom_providers: Vec<CustomProvider>,
-    agent_names: Vec<String>,
-    shadowed_providers: Vec<String>,
-    warnings: Vec<String>,
-}
-
-fn pi_agent_dir() -> Result<PathBuf, String> {
-    Ok(home_dir()?.join(".pi").join("agent"))
-}
-fn pi_models_file(agent: &Path) -> PathBuf {
-    agent.join("models.json")
-}
-
-fn pi_executable_candidates(custom_path: Option<&str>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(custom) = custom_path.map(str::trim).filter(|value| !value.is_empty()) {
-        candidates.push(PathBuf::from(custom));
-    }
-    if let Some(path) = env::var_os("PATH") {
-        candidates.extend(env::split_paths(&path).map(|directory| directory.join("pi")));
-    }
-    #[cfg(target_os = "macos")]
-    candidates.push(PathBuf::from("/opt/homebrew/bin/pi"));
-    if let Ok(home) = home_dir() {
-        candidates.push(home.join(".local").join("bin").join("pi"));
-        candidates.push(home.join(".bun").join("bin").join("pi"));
-    }
-    candidates.push(PathBuf::from("pi"));
-    let mut seen = HashSet::new();
-    candidates.retain(|candidate| seen.insert(candidate.clone()));
-    candidates
-}
-fn load_pi_models(custom_path: Option<&str>) -> Result<(Vec<PiModelOption>, PathBuf), String> {
-    let candidates = pi_executable_candidates(custom_path);
-    let mut failure_reasons = Vec::new();
-    for candidate in &candidates {
-        let mut command = Command::new(candidate);
-        command.arg("--list-models").env("NO_COLOR", "1");
-        command.env("PATH", build_subprocess_path(candidate.parent()));
-        let output = match command.output() {
-            Ok(output) => output,
-            Err(error) => {
-                failure_reasons.push(format!("{}: {error}", candidate.display()));
-                continue;
-            }
-        };
-        if !output.status.success() {
-            let status_code = output
-                .status
-                .code()
-                .map_or("terminated".to_string(), |code| code.to_string());
-            failure_reasons.push(format!("{}: 进程退出码 {status_code}", candidate.display()));
-            continue;
-        }
-        let models = parse_pi_models_table(&String::from_utf8_lossy(&output.stdout));
-        return Ok((models, candidate.clone()));
-    }
-    Err(format!(
-        "未找到可用的 pi 可执行文件或无法通过 `pi --list-models` 读取模型。\n尝试详情：\n{}",
-        failure_reasons.join("\n")
-    ))
-}
-
-fn parse_size_token(token: &str) -> Option<u64> {
-    let trimmed = token.trim();
-    let (numeric, multiplier) = if let Some(prefix) = trimmed.strip_suffix(['M', 'm']) {
-        (prefix, 1_000_000.0)
-    } else if let Some(prefix) = trimmed.strip_suffix(['K', 'k']) {
-        (prefix, 1_000.0)
-    } else {
-        (trimmed, 1.0)
-    };
-    numeric
-        .parse::<f64>()
-        .ok()
-        .map(|value| (value * multiplier).round() as u64)
-}
-
-fn parse_pi_models_table(content: &str) -> Vec<PiModelOption> {
-    let mut models = Vec::new();
-    for line in content.lines() {
-        let columns: Vec<&str> = line.split_whitespace().collect();
-        if columns.len() != 6 || columns[0].eq_ignore_ascii_case("provider") {
-            continue;
-        }
-        let [provider, id, context, max_out, thinking, images] = [
-            columns[0], columns[1], columns[2], columns[3], columns[4], columns[5],
-        ];
-        models.push(PiModelOption {
-            provider: provider.to_string(),
-            id: id.to_string(),
-            selector: format!("{provider}/{id}"),
-            context_window: parse_size_token(context),
-            max_tokens: parse_size_token(max_out),
-            reasoning: thinking.eq_ignore_ascii_case("yes"),
-            images: images.eq_ignore_ascii_case("yes"),
-            thinking: Vec::new(),
-            default_thinking_level: None,
-        });
-    }
-    models
-}
-
-fn agent_name_from_markdown(content: &str) -> Option<String> {
-    let block = content.strip_prefix("---")?;
-    let end = block.find("\n---")?;
-    for line in block[..end].lines() {
-        if let Some(value) = line.trim().strip_prefix("name:") {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// pi-roster ships zero bundled personas (unlike pi-subagents' six builtins),
-/// so the roster is exactly whatever `.md` files exist here — no seed list.
-fn discover_pi_agent_names(agent: &Path) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    let agents_dir = agent.join("agents");
-    let mut stack = vec![agents_dir];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|extension| extension.to_str()) == Some("md") {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Some(name) = agent_name_from_markdown(&content) {
-                        if !names.contains(&name) {
-                            names.push(name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    names
-}
-
-const ROSTER_CONFIG_KEY: &str = "pi-roster";
-
-/// Extracts and parses the `"pi-roster"` block from an already-loaded
-/// settings map. The persisted keys follow pi-roster's model-profile schema;
-/// the result is translated into the Studio-facing Tier shape.
-fn load_pi_roster_config(
-    settings: &serde_json::Map<String, JsonValue>,
-) -> Result<(PiTiersFile, bool), String> {
-    let Some(block) = settings.get(ROSTER_CONFIG_KEY) else {
-        return Ok((PiTiersFile::default(), false));
-    };
-    let parsed: PiRosterConfig = serde_json::from_value(block.clone()).map_err(|error| {
-        format!("解析 settings.json 中的 “{ROSTER_CONFIG_KEY}” 配置块失败: {error}")
-    })?;
-    Ok((pi_roster_config_to_pi_tiers(parsed), true))
-}
-
-/// `pi`'s settings.json shares the same coding-agent core as OMP's config.yml,
-/// so top-level `disabledProviders` filters model discovery pi-wide (not just
-/// the `"pi-roster"` block) exactly like OMP's does.
-fn load_pi_settings_map(path: &Path) -> Result<serde_json::Map<String, JsonValue>, String> {
-    if !path.exists() {
-        return Ok(serde_json::Map::new());
-    }
-    let content = fs::read_to_string(path)
-        .map_err(|error| format!("无法读取 {}: {error}", display_path(path)))?;
-    let parsed: JsonValue = serde_json::from_str(&content)
-        .map_err(|error| format!("解析 {} 失败: {error}", display_path(path)))?;
-    match parsed {
-        JsonValue::Object(map) => Ok(map),
-        _ => Err(format!("{} 不是合法的 JSON 对象", display_path(path))),
-    }
-}
-
-fn strip_json_comments(content: &str) -> String {
-    let chars = content.chars().collect::<Vec<_>>();
-    let mut without_comments = String::with_capacity(content.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut line_comment = false;
-    let mut index = 0;
-    while index < chars.len() {
-        let character = chars[index];
-        if line_comment {
-            if character == '\n' {
-                line_comment = false;
-                without_comments.push(character);
-            }
-            index += 1;
-            continue;
-        }
-        if in_string {
-            without_comments.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            without_comments.push(character);
-            index += 1;
-        } else if character == '/' && chars.get(index + 1) == Some(&'/') {
-            line_comment = true;
-            index += 2;
-        } else {
-            without_comments.push(character);
-            index += 1;
-        }
-    }
-
-    let chars = without_comments.chars().collect::<Vec<_>>();
-    let mut result = String::with_capacity(without_comments.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut index = 0;
-    while index < chars.len() {
-        let character = chars[index];
-        if in_string {
-            result.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            result.push(character);
-            index += 1;
-            continue;
-        }
-        if character == ',' {
-            let mut next = index + 1;
-            while chars
-                .get(next)
-                .is_some_and(|character| character.is_whitespace())
-            {
-                next += 1;
-            }
-            if matches!(chars.get(next), Some(&'}') | Some(&']')) {
-                index += 1;
-                continue;
-            }
-        }
-        result.push(character);
-        index += 1;
-    }
-    result
-}
-fn load_pi_models_map(path: &Path) -> Result<(serde_json::Map<String, JsonValue>, bool), String> {
-    if !path.exists() {
-        return Ok((serde_json::Map::new(), false));
-    }
-    let content = fs::read_to_string(path)
-        .map_err(|error| format!("无法读取 {}: {error}", display_path(path)))?;
-    if content.trim().is_empty() {
-        return Ok((serde_json::Map::new(), true));
-    }
-    let sanitized = strip_json_comments(&content);
-    let parsed: JsonValue = serde_json::from_str(&sanitized)
-        .map_err(|error| format!("解析 {} 失败: {error}", display_path(path)))?;
-    match parsed {
-        JsonValue::Object(map) => Ok((map, true)),
-        _ => Err(format!("{} 不是合法的 JSON 对象", display_path(path))),
-    }
-}
-
-fn ensure_pi_models_file(path: &Path) -> Result<(), String> {
-    let needs_initialization = match fs::read_to_string(path) {
-        Ok(content) => content.trim().is_empty(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => {
-            return Err(format!("无法读取 {}: {error}", display_path(path)));
-        }
-    };
-    if needs_initialization {
-        write_text_atomically(path, "{\n  \"providers\": {}\n}\n")?;
-    }
-    Ok(())
-}
-
-fn json_string_list(value: Option<&JsonValue>) -> Vec<String> {
-    let Some(JsonValue::Array(items)) = value else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(JsonValue::as_str)
-        .map(str::to_string)
-        .collect()
-}
-
-/// Mirrors `set_nested_disabled_providers` for pi's JSON settings: only the
-/// global provider-id string entries are managed here; path-scoped entries
-/// (`{path, providers}`) configured outside this app are preserved verbatim.
-fn set_json_disabled_providers(
-    settings: &mut serde_json::Map<String, JsonValue>,
-    shadowed: &[String],
-) {
-    let scoped_entries: Vec<JsonValue> = settings
-        .get("disabledProviders")
-        .and_then(JsonValue::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|entry| !entry.is_string())
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut globals: Vec<String> = shadowed
-        .iter()
-        .map(|provider| provider.trim().to_string())
-        .filter(|provider| !provider.is_empty())
-        .collect();
-    globals.sort();
-    globals.dedup();
-
-    let mut sequence: Vec<JsonValue> = globals.into_iter().map(JsonValue::String).collect();
-    sequence.extend(scoped_entries);
-
-    if sequence.is_empty() {
-        settings.remove("disabledProviders");
-    } else {
-        settings.insert("disabledProviders".to_string(), JsonValue::Array(sequence));
-    }
-}
-
-fn overlay_pi_model_capabilities(models: &mut [PiModelOption], providers: &[CustomProvider]) {
-    for model in models {
-        let Some(custom_model) = providers
-            .iter()
-            .find(|provider| provider.id == model.provider)
-            .and_then(|provider| {
-                provider
-                    .models
-                    .iter()
-                    .find(|candidate| candidate.id == model.id)
-            })
-        else {
-            continue;
-        };
-        if custom_model.thinking.is_empty() {
-            continue;
-        }
-        model.reasoning = true;
-        model.thinking = custom_model.thinking.clone();
-        model.default_thinking_level = custom_model.default_thinking_level.clone();
-    }
-}
-
-fn load_pi_snapshot_from_disk(custom_pi_path: Option<&str>) -> Result<PiSnapshot, String> {
-    let agent = pi_agent_dir()?;
-    let settings_path = agent.join("settings.json");
-    let models_path = pi_models_file(&agent);
-    let settings = load_pi_settings_map(&settings_path)?;
-    let (models_config, _) = load_pi_models_map(&models_path)?;
-    let (tiers, roster_config_exists) = load_pi_roster_config(&settings)?;
-    let mut warnings = Vec::new();
-    if !roster_config_exists {
-        warnings.push(format!(
-            "{} 中没有 “{ROSTER_CONFIG_KEY}” 配置块，将从空白配置开始",
-            display_path(&settings_path)
-        ));
-    }
-    let shadowed_providers = json_string_list(settings.get("disabledProviders"));
-    let (mut models, model_executable) = load_pi_models(custom_pi_path)?;
-    let custom_providers = load_pi_custom_providers(&models_config);
-    overlay_pi_model_capabilities(&mut models, &custom_providers);
-    let agent_names = discover_pi_agent_names(&agent);
-    warnings.push(format!(
-        "模型目录来源：{} · pi --list-models",
-        display_path(&model_executable)
-    ));
-
-    Ok(PiSnapshot {
-        settings_path: display_path(&settings_path),
-        roster_config_exists,
-        tiers,
-        models,
-        custom_providers,
-        agent_names,
-        shadowed_providers,
-        warnings,
-    })
-}
-
-fn valid_pi_roster_model_spec(selector: &str) -> bool {
-    let trimmed = selector.trim();
-    if trimmed.is_empty() || trimmed.starts_with('@') {
-        return false;
-    }
-    let Some((base_model, thinking)) = trimmed.rsplit_once(':') else {
-        return false;
-    };
-    if !THINKING_LEVELS.contains(&thinking) {
-        return false;
-    }
-    let Some((provider, model_id)) = base_model.split_once('/') else {
-        return false;
-    };
-    !provider.is_empty() && !model_id.is_empty()
-}
-
-fn validate_pi_tiers(tiers: &PiTiersFile, shadowed: &HashSet<&str>) -> Result<(), String> {
-    if tiers.tiers.is_empty() {
-        return Err("至少需要一个 model profile".to_string());
-    }
-    let default_profile = tiers.default.trim();
-    if default_profile.is_empty() {
-        return Err("必须设置 default model profile".to_string());
-    }
-    if !tiers.tiers.contains_key(default_profile) {
-        return Err(format!("default model profile “{}”不存在", tiers.default));
-    }
-
-    for (tier_name, tier) in &tiers.tiers {
-        if tier_name.trim().is_empty() {
-            return Err("model profile 名称不能为空".to_string());
-        }
-        if !valid_pi_roster_model_spec(&tier.model) {
-            return Err(format!(
-                "Model profile “{tier_name}”的主模型必须是 provider/model-id:thinking 格式"
-            ));
-        }
-        if selector_provider(&tier.model).is_some_and(|provider| shadowed.contains(provider)) {
-            return Err(format!(
-                "Model profile “{tier_name}”的主模型仍使用 shadowed provider"
-            ));
-        }
-        for selector in &tier.fallback_models {
-            if !valid_pi_roster_model_spec(selector) {
-                return Err(format!(
-                    "Model profile “{tier_name}”的 fallback 必须是 provider/model-id:thinking 格式"
-                ));
-            }
-            if selector_provider(selector).is_some_and(|provider| shadowed.contains(provider)) {
-                return Err(format!(
-                    "Model profile “{tier_name}”的 fallback 仍使用 shadowed provider"
-                ));
-            }
-        }
-    }
-
-    let mut seen_agents = HashSet::new();
-    for (tier_name, agents) in &tiers.assignments {
-        if !tiers.tiers.contains_key(tier_name) {
-            return Err(format!(
-                "assignments 引用了不存在的 model profile “{tier_name}”"
-            ));
-        }
-        let mut seen_in_profile = HashSet::new();
-        for agent in agents {
-            let agent_name = agent.trim();
-            if agent_name.is_empty() {
-                return Err(format!("assignments.{tier_name} 包含空 Agent 名称"));
-            }
-            if !seen_in_profile.insert(agent_name.to_string()) {
-                continue;
-            }
-            if !seen_agents.insert(agent_name.to_string()) {
-                return Err(format!("Agent “{agent_name}”被分配到多个 model profile"));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn load_pi_snapshot(pi_path: Option<String>) -> Result<PiSnapshot, String> {
-    load_pi_snapshot_from_disk(pi_path.as_deref())
-}
-
-#[tauri::command]
-fn save_pi_tiers(
-    tiers: PiTiersFile,
-    shadowed_providers: Vec<String>,
-    pi_path: Option<String>,
-) -> Result<PiSnapshot, String> {
-    let shadowed = shadowed_providers
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    validate_pi_tiers(&tiers, &shadowed)?;
-    let agent = pi_agent_dir()?;
-    let settings_path = agent.join("settings.json");
-
-    let mut settings = load_pi_settings_map(&settings_path)?;
-    set_json_disabled_providers(&mut settings, &shadowed_providers);
-
-    // Pi-roster reads the model-profile block directly. Translate the
-    // Studio's Tier-oriented editing model at this persistence boundary
-    // instead of writing the obsolete `default`/`tiers` keys.
-    let roster_config = pi_tiers_to_roster_config(&tiers);
-    let roster_value = serde_json::to_value(&roster_config)
-        .map_err(|error| format!("序列化 “{ROSTER_CONFIG_KEY}” 配置块失败: {error}"))?;
-    settings.insert(ROSTER_CONFIG_KEY.to_string(), roster_value);
-
-    let settings_json = serde_json::to_string_pretty(&JsonValue::Object(settings))
-        .map_err(|error| format!("序列化 settings.json 失败: {error}"))?;
-    write_text_atomically(&settings_path, &format!("{settings_json}\n"))?;
-
-    load_pi_snapshot_from_disk(pi_path.as_deref())
-}
 #[tauri::command]
 async fn discover_custom_provider_models(
     request: CustomProviderDiscoveryRequest,
 ) -> Result<Vec<CustomProviderModel>, String> {
-    let target = request.target.as_deref().unwrap_or("omp");
-    let (supported_apis, product_label) = match target {
-        "omp" => (&CUSTOM_PROVIDER_APIS[..], "OMP"),
-        "pi" => (&PI_CUSTOM_PROVIDER_APIS[..], "Pi"),
-        _ => return Err(format!("不支持的 custom provider 配置目标 “{target}”")),
-    };
     let provider_id = request.provider_id.trim();
     if !valid_custom_provider_id(provider_id) {
         return Err("Provider ID 无效".to_string());
     }
     let api = request.api.trim();
-    if !supported_apis.contains(&api) {
-        return Err(format!(
-            "Custom provider Type “{api}”不受 {product_label} 支持"
-        ));
+    if !CUSTOM_PROVIDER_APIS.contains(&api) {
+        return Err(format!("Custom provider Type “{api}”不受 OMP 支持"));
     }
 
     let base_url = reqwest::Url::parse(request.base_url.trim().trim_end_matches('/'))
@@ -3046,32 +2086,13 @@ async fn discover_custom_provider_models(
         reqwest::Url::parse(saved.trim().trim_end_matches('/')).is_ok_and(|url| url == base_url)
     };
     let urls = custom_provider_model_urls(base_url.as_str())?;
-    let omp_config;
-    let (existing_key, configured_headers) = match target {
-        "omp" => {
-            let agent = agent_dir()?;
-            (omp_config, _) = load_models_yaml(&models_file(&agent))?;
-            let saved = existing_custom_provider(&omp_config, provider_id)
-                .and_then(YamlValue::as_mapping)
-                .filter(|config| config.get("baseUrl").and_then(YamlValue::as_str).is_some_and(matches_base));
-            (
-                saved.and_then(|config| mapping_string(config, "apiKey")),
-                saved.and_then(|config| config.get("headers")),
-            )
-        }
-        "pi" => {
-            let agent = pi_agent_dir()?;
-            let (models_root, _) = load_pi_models_map(&pi_models_file(&agent))?;
-            let key = existing_pi_custom_provider(&models_root, provider_id)
-                .and_then(JsonValue::as_object)
-                .filter(|config| config.get("baseUrl").and_then(JsonValue::as_str).is_some_and(matches_base))
-                .and_then(|config| config.get("apiKey"))
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
-            (key, None)
-        }
-        _ => unreachable!("custom provider target was validated above"),
-    };
+    let agent = agent_dir()?;
+    let (models_root, _) = load_models_yaml(&models_file(&agent))?;
+    let saved = existing_custom_provider(&models_root, provider_id)
+        .and_then(YamlValue::as_mapping)
+        .filter(|config| config.get("baseUrl").and_then(YamlValue::as_str).is_some_and(matches_base));
+    let existing_key = saved.and_then(|config| mapping_string(config, "apiKey"));
+    let configured_headers = saved.and_then(|config| config.get("headers"));
     let draft_key = request.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty());
     let api_key = draft_key
         .or(existing_key.as_deref())
@@ -3104,79 +2125,70 @@ async fn discover_custom_provider_models(
         if !status.is_success() {
             return Err(format!("读取 provider model 列表失败（HTTP {status}）"));
         }
-        let models = parse_custom_provider_model_list(&body, supported_apis)?;
+        let models = parse_custom_provider_model_list(&body)?;
         if models.is_empty() {
             return Err("接口未返回模型列表，请确认 Base URL 与 API key".to_string());
         }
-        let rich_models = fetch_optional_custom_provider_rich_catalog(
-            &client,
-            url,
-            supported_apis,
-        )
-        .await?
-        .unwrap_or_default();
+        let rich_models = fetch_optional_custom_provider_rich_catalog(&client, url)
+            .await?
+            .unwrap_or_default();
         return Ok(merge_custom_provider_model_capabilities(models, rich_models));
     }
     Err("provider model discovery 没有可用 endpoint".to_string())
 }
 
-fn save_pi_custom_providers_to_disk(
-    request: &CustomProviderSaveRequest,
-) -> Result<Vec<CustomProvider>, String> {
-    let agent = pi_agent_dir()?;
-    let models_path = pi_models_file(&agent);
-    let (mut root, models_exists) = load_pi_models_map(&models_path)?;
-    validate_pi_custom_providers(&request.custom_providers)?;
-    validate_removed_custom_providers(
-        &request.custom_providers,
-        &request.removed_custom_providers,
-    )?;
-    set_pi_custom_providers(
+const STALE_CUSTOM_PROVIDER_STORE: &str =
+    "Provider 配置已在外部修改。请关闭编辑窗口，点击“重新读取”后重试。";
+
+/// Use a process-local hash key because the document includes credentials and
+/// only the opaque version token crosses IPC.
+fn document_version(serialized: &str) -> String {
+    // LazyLock is newer than the crate's declared MSRV (1.77.2).
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    let fingerprint = HASHER.get_or_init(RandomState::new).hash_one(serialized);
+    format!("{fingerprint:016x}")
+}
+
+fn omp_models_version(root: &YamlValue) -> Result<String, String> {
+    serde_yaml::to_string(root)
+        .map(|serialized| document_version(&serialized))
+        .map_err(|error| format!("序列化 models.yml 失败: {error}"))
+}
+
+#[tauri::command]
+fn save_custom_providers(
+    request: CustomProviderSaveRequest,
+) -> Result<CustomProviderStore, String> {
+    let agent = agent_dir()?;
+    let models_path = models_file(&agent);
+    let (mut root, models_exists) = load_models_yaml(&models_path)?;
+    if omp_models_version(&root)? != request.expected_version {
+        return Err(STALE_CUSTOM_PROVIDER_STORE.to_string());
+    }
+    validate_custom_providers(&root, &request.custom_providers)?;
+    validate_removed_custom_providers(&request.custom_providers, &request.removed_custom_providers)?;
+    set_custom_providers(
         &mut root,
         &request.custom_providers,
         &request.removed_custom_providers,
     );
-    if models_exists
+    let version = if models_exists
         || !request.custom_providers.is_empty()
         || !request.removed_custom_providers.is_empty()
     {
-        let json = serde_json::to_string_pretty(&JsonValue::Object(root.clone()))
-            .map_err(|error| format!("序列化 models.json 失败: {error}"))?;
-        write_text_atomically(&models_path, &format!("{json}\n"))?;
-    }
-    Ok(load_pi_custom_providers(&root))
+        let content = serde_yaml::to_string(&root)
+            .map_err(|error| format!("生成 {} 失败: {error}", display_path(&models_path)))?;
+        write_text_atomically(&models_path, &content)?;
+        document_version(&content)
+    } else {
+        request.expected_version
+    };
+    Ok(CustomProviderStore {
+        custom_providers: load_custom_providers(&root),
+        version,
+    })
 }
-#[tauri::command]
-fn save_custom_providers(
-    request: CustomProviderSaveRequest,
-) -> Result<Vec<CustomProvider>, String> {
-    match request.target.as_deref().unwrap_or("omp") {
-        "pi" => save_pi_custom_providers_to_disk(&request),
-        "omp" => {
-            let agent = agent_dir()?;
-            let models_path = models_file(&agent);
-            let (mut root, models_exists) = load_models_yaml(&models_path)?;
-            validate_custom_providers(&root, &request.custom_providers)?;
-            validate_removed_custom_providers(
-                &request.custom_providers,
-                &request.removed_custom_providers,
-            )?;
-            set_custom_providers(
-                &mut root,
-                &request.custom_providers,
-                &request.removed_custom_providers,
-            );
-            if models_exists
-                || !request.custom_providers.is_empty()
-                || !request.removed_custom_providers.is_empty()
-            {
-                write_yaml_atomically(&models_path, &root)?;
-            }
-            Ok(load_custom_providers(&root))
-        }
-        target => Err(format!("不支持的 custom provider 配置目标 “{target}”")),
-    }
-}
+
 #[tauri::command]
 fn open_config_file(kind: String) -> Result<(), String> {
     let agent = agent_dir()?;
@@ -3190,14 +2202,6 @@ fn open_config_file(kind: String) -> Result<(), String> {
         };
         return Err(format!("文件 {} 不存在，{next_step}", display_path(&path)));
     }
-    reveal_in_file_manager(&path)
-}
-
-#[tauri::command]
-fn open_pi_models_file() -> Result<(), String> {
-    let agent = pi_agent_dir()?;
-    let path = pi_models_file(&agent);
-    ensure_pi_models_file(&path)?;
     reveal_in_file_manager(&path)
 }
 
@@ -3393,10 +2397,7 @@ pub fn run() {
             save_snapshot,
             save_custom_providers,
             open_config_file,
-            open_pi_models_file,
-            discover_custom_provider_models,
-            load_pi_snapshot,
-            save_pi_tiers
+            discover_custom_provider_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running OMP Model Studio");
@@ -3422,6 +2423,13 @@ mod tests {
             default_thinking_level: None,
             configuration: model_metadata::Configuration::new(),
         }
+    }
+    /// Version the backend stamps on the current on-disk store, so tests can
+    /// freeze the same value the editor would have read from a snapshot.
+    fn omp_store_version() -> Result<String, String> {
+        let agent = agent_dir()?;
+        let (root, _) = load_models_yaml(&models_file(&agent))?;
+        omp_models_version(&root)
     }
 
     #[test]
@@ -3665,6 +2673,7 @@ mod tests {
         let previous_home = env::var_os("HOME");
         env::set_var("HOME", &home);
         let result = save_custom_providers(CustomProviderSaveRequest {
+            expected_version: omp_store_version().expect("test models.yml should be readable"),
             custom_providers: vec![
                 CustomProviderSave {
                     id: "gateway".to_string(),
@@ -3689,7 +2698,6 @@ mod tests {
                 },
             ],
             removed_custom_providers: Vec::new(),
-            target: None,
         });
         if let Some(previous_home) = previous_home {
             env::set_var("HOME", previous_home);
@@ -3697,7 +2705,13 @@ mod tests {
             env::remove_var("HOME");
         }
 
-        let providers = result.expect("custom provider save should succeed");
+        let store = result.expect("custom provider save should succeed");
+        assert_eq!(store.version.len(), 16, "version must be fixed-width hex");
+        assert!(store
+            .version
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)));
+        let providers = store.custom_providers;
         assert_eq!(providers.len(), 2);
         let gateway = providers
             .iter()
@@ -3830,6 +2844,129 @@ mod tests {
     }
 
     #[test]
+    fn custom_provider_save_refuses_a_stale_editor_version() {
+        let _home_guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let agent = home.join(".omp").join("agent");
+        fs::create_dir_all(&agent).expect("test config directory should be created");
+        let models_path = agent.join("models.yml");
+        fs::write(
+            &models_path,
+            "providers:\n  gateway:\n    baseUrl: https://old.example.com/v1\n    api: openai-completions\n    apiKey: OLD_KEY\n    models:\n      - id: keep\n        api: openai-completions\n",
+        )
+        .expect("test models.yml should be written");
+
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
+        let stale_version = omp_store_version().expect("test models.yml should be readable");
+        // Outside edit: an existing model's API changes and a provider is added.
+        let external = "providers:\n  gateway:\n    baseUrl: https://old.example.com/v1\n    api: openai-completions\n    apiKey: OLD_KEY\n    models:\n      - id: keep\n        api: anthropic-messages\n  outside:\n    baseUrl: https://outside.example.com/v1\n    api: anthropic-messages\n    apiKey: OUTSIDE_KEY\n    models:\n      - id: added\n        api: anthropic-messages\n";
+        fs::write(&models_path, external).expect("external edit should be written");
+        let external_bytes = external.as_bytes().to_vec();
+        assert_ne!(
+            stale_version,
+            omp_store_version().expect("externally edited models.yml should be readable"),
+            "an outside edit must change the store version"
+        );
+
+        let stale_attempts = [
+            // update, delete and add all come from the same frozen editor snapshot
+            CustomProviderSaveRequest {
+                expected_version: stale_version.clone(),
+                custom_providers: vec![CustomProviderSave {
+                    id: "gateway".to_string(),
+                    base_url: "https://stale.example.com/v1".to_string(),
+                    api: "openai-completions".to_string(),
+                    api_key: None,
+                    models: vec![saved_model("keep", "openai-completions")],
+                }],
+                removed_custom_providers: Vec::new(),
+            },
+            CustomProviderSaveRequest {
+                expected_version: stale_version.clone(),
+                custom_providers: Vec::new(),
+                removed_custom_providers: vec!["gateway".to_string()],
+            },
+            CustomProviderSaveRequest {
+                expected_version: stale_version.clone(),
+                custom_providers: vec![CustomProviderSave {
+                    id: "stale-add".to_string(),
+                    base_url: "https://stale.example.com/v1".to_string(),
+                    api: "openai-responses".to_string(),
+                    api_key: Some("STALE_KEY".to_string()),
+                    models: vec![saved_model("stale", "openai-responses")],
+                }],
+                removed_custom_providers: Vec::new(),
+            },
+        ];
+        for request in stale_attempts {
+            let error =
+                save_custom_providers(request).expect_err("a stale editor version must be refused");
+            assert_eq!(error, STALE_CUSTOM_PROVIDER_STORE);
+            assert_eq!(
+                fs::read(&models_path).expect("models.yml should remain readable"),
+                external_bytes,
+                "a refused save must leave the externally edited bytes untouched"
+            );
+        }
+
+        // Re-reading the store (fresh version) unblocks the retry.
+        let store = save_custom_providers(CustomProviderSaveRequest {
+            expected_version: omp_store_version().expect("test models.yml should be readable"),
+            custom_providers: vec![CustomProviderSave {
+                id: "retry".to_string(),
+                base_url: "https://retry.example.com/v1".to_string(),
+                api: "openai-responses".to_string(),
+                api_key: Some("RETRY_KEY".to_string()),
+                models: vec![saved_model("retry-model", "openai-responses")],
+            }],
+            removed_custom_providers: Vec::new(),
+        })
+        .expect("a retry on the fresh version should save");
+        assert_ne!(store.version, stale_version);
+        assert_eq!(
+            store.version,
+            omp_store_version().expect("saved models.yml should be readable"),
+            "the returned version must describe what a fresh load would read"
+        );
+        let written =
+            fs::read_to_string(&models_path).expect("saved models.yml should remain readable");
+        assert!(
+            !written.contains("stale.example.com"),
+            "a refused save must never reach disk"
+        );
+        let parsed: YamlValue =
+            serde_yaml::from_str(&written).expect("saved models.yml should be valid YAML");
+        assert_eq!(
+            parsed["providers"]["gateway"]["models"][0]["api"].as_str(),
+            Some("anthropic-messages"),
+            "the externally changed model API must not be reverted"
+        );
+        assert_eq!(
+            parsed["providers"]["outside"]["apiKey"].as_str(),
+            Some("OUTSIDE_KEY"),
+            "the externally added provider must be retained"
+        );
+        assert_eq!(
+            parsed["providers"]["retry"]["baseUrl"].as_str(),
+            Some("https://retry.example.com/v1")
+        );
+        assert!(store
+            .custom_providers
+            .iter()
+            .any(|provider| provider.id == "outside"));
+
+        if let Some(previous_home) = previous_home {
+            env::set_var("HOME", previous_home);
+        } else {
+            env::remove_var("HOME");
+        }
+        fs::remove_dir_all(home).expect("isolated test home should be removed");
+    }
+
+    #[test]
     fn clearing_nested_values_does_not_leave_empty_parent_mappings() {
         let mut root: YamlValue =
             serde_yaml::from_str("otherSetting: preserved\nadvisor:\n  enabled: true\n")
@@ -3850,7 +2987,6 @@ mod tests {
     fn custom_provider_discovery_parser_reads_all_models() {
         let models = parse_custom_provider_model_list(
             r#"{"data":[{"id":"model-a","name":"Model A","supported_endpoint_types":["openai"]},{"id":"model-b","supported_endpoint_types":["anthropic"]},{"id":"model-a"}]}"#,
-            &CUSTOM_PROVIDER_APIS,
         )
         .expect("provider model list should parse");
 
@@ -3884,12 +3020,10 @@ mod tests {
     fn custom_provider_rich_catalog_overlays_authoritative_models() {
         let regular = parse_custom_provider_model_list(
             r#"{"data":[{"id":"gpt-5.6-sol","name":"gpt-5.6-sol"},{"id":"keep"}]}"#,
-            &CUSTOM_PROVIDER_APIS,
         )
         .expect("regular model list should parse");
         let rich = parse_custom_provider_model_list(
             r#"{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT 5.6 Sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"max"},{"effort":"ultra"}]},{"slug":"hidden","visibility":"hide","supported_reasoning_levels":[{"effort":"high"}]},{"slug":"not-in-regular"}]}"#,
-            &CUSTOM_PROVIDER_APIS,
         )
         .expect("rich model catalog should parse");
         let merged = merge_custom_provider_model_capabilities(regular, rich);
@@ -3936,21 +3070,6 @@ mod tests {
         assert_eq!(
             yaml["models"][0]["thinking"]["defaultLevel"],
             YamlValue::String("medium".to_string())
-        );
-
-        let json = custom_provider_json(None, &provider);
-        assert_eq!(json["models"][0]["reasoning"], JsonValue::Bool(true));
-        assert_eq!(
-            json["models"][0]["thinkingLevelMap"]["minimal"],
-            JsonValue::Null
-        );
-        assert_eq!(
-            json["models"][0]["thinkingLevelMap"]["low"],
-            JsonValue::String("low".to_string())
-        );
-        assert_eq!(
-            json["models"][0]["thinkingLevelMap"]["max"],
-            JsonValue::String("max".to_string())
         );
     }
 
@@ -4022,7 +3141,6 @@ mod tests {
                     base_url,
                     api: "anthropic-messages".to_string(),
                     api_key: None,
-                    target: None,
                 },
             ));
             let mismatched = discover(format!("{base_url}/other"));
@@ -4119,11 +3237,11 @@ mod tests {
                 base_url: format!("http://{address}/v1"),
                 api: "openai-responses".to_string(),
                 api_key: Some("test-key".to_string()),
-                target: None,
             },
         ));
         let result = result.and_then(|models| {
             let request: CustomProviderSaveRequest = serde_json::from_value(serde_json::json!({
+                "expectedVersion": omp_store_version()?,
                 "customProviders": [{
                     "id": "test-provider", "baseUrl": format!("http://{address}/v1"),
                     "api": "openai-responses", "apiKey": "test-key",
@@ -4193,10 +3311,20 @@ mod tests {
             })).collect::<Vec<_>>()
         });
         let models = merge_custom_provider_model_capabilities(
-            parse_custom_provider_model_list(&ordinary.to_string(), &CUSTOM_PROVIDER_APIS).unwrap(),
-            parse_custom_provider_model_list(&rich.to_string(), &CUSTOM_PROVIDER_APIS).unwrap(),
+            parse_custom_provider_model_list(&ordinary.to_string()).unwrap(),
+            parse_custom_provider_model_list(&rich.to_string()).unwrap(),
         );
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = temporary_home();
+        let agent = home.join(".omp/agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("models.yml"),
+            "providers:\n  gateway:\n    baseUrl: https://example.com/v1\n    apiKey: test-key\n    models:\n      - id: uni/claude-fable-5.2\n        api: anthropic-messages\n        reasoning: false\n        maxTokens: 64000\n        headers:\n          X-Team: keep\n"
+        ).unwrap();
+        let previous_home = env::var_os("HOME");
+        env::set_var("HOME", &home);
         let request: CustomProviderSaveRequest = serde_json::from_value(serde_json::json!({
+            "expectedVersion": omp_store_version().expect("test models.yml should be readable"),
             "customProviders": [{
                 "id": "gateway", "baseUrl": "https://example.com/v1",
                 "api": "anthropic-messages", "apiKey": null,
@@ -4207,22 +3335,15 @@ mod tests {
                 })).collect::<Vec<_>>()
             }]
         })).unwrap();
-        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = temporary_home();
-        let agent = home.join(".omp/agent");
-        fs::create_dir_all(&agent).unwrap();
-        fs::write(agent.join("models.yml"),
-            "providers:\n  gateway:\n    baseUrl: https://example.com/v1\n    apiKey: test-key\n    models:\n      - id: uni/claude-fable-5.2\n        api: anthropic-messages\n        reasoning: false\n        maxTokens: 64000\n        headers:\n          X-Team: keep\n"
-        ).unwrap();
-        let previous_home = env::var_os("HOME");
-        env::set_var("HOME", &home);
         let result = save_custom_providers(request);
         if let Some(previous_home) = previous_home {
             env::set_var("HOME", previous_home);
         } else {
             env::remove_var("HOME");
         }
-        let providers = result.expect("Anthropic catalog should save");
+        let providers = result
+            .expect("Anthropic catalog should save")
+            .custom_providers;
         let (written, _) = load_models_yaml(&agent.join("models.yml")).unwrap();
         let saved = written["providers"]["gateway"]["models"].as_sequence().unwrap();
         for (index, id) in ids.iter().enumerate() {
@@ -4511,7 +3632,6 @@ echo '{"models":[{"provider":"openai","id":"chat-model"}]}'
         let previous_path = env::var_os("PATH");
         env::set_var("PATH", "");
         let omp_candidates = executable_candidates(None);
-        let pi_candidates = pi_executable_candidates(None);
         match previous_path {
             Some(path) => env::set_var("PATH", path),
             None => env::remove_var("PATH"),
@@ -4520,8 +3640,6 @@ echo '{"models":[{"provider":"openai","id":"chat-model"}]}'
         let home = home_dir().expect("home directory should be available");
         let local_omp = home.join(".local").join("bin").join("omp");
         let bun_omp = home.join(".bun").join("bin").join("omp");
-        let local_pi = home.join(".local").join("bin").join("pi");
-        let bun_pi = home.join(".bun").join("bin").join("pi");
         assert!(
             omp_candidates
                 .iter()
@@ -4532,526 +3650,8 @@ echo '{"models":[{"provider":"openai","id":"chat-model"}]}'
                     .position(|candidate| candidate == &bun_omp)
                     .expect("bun omp fallback should be present")
         );
-        assert!(
-            pi_candidates
-                .iter()
-                .position(|candidate| candidate == &local_pi)
-                .expect("local pi fallback should be present")
-                < pi_candidates
-                    .iter()
-                    .position(|candidate| candidate == &bun_pi)
-                    .expect("bun pi fallback should be present")
-        );
     }
 
-    #[test]
-    fn parse_size_token_handles_k_and_m_suffixes() {
-        assert_eq!(parse_size_token("128K"), Some(128_000));
-        assert_eq!(parse_size_token("272K"), Some(272_000));
-        assert_eq!(parse_size_token("1.0M"), Some(1_000_000));
-        assert_eq!(parse_size_token("262.1K"), Some(262_100));
-        assert_eq!(parse_size_token("131.1K"), Some(131_100));
-    }
-
-    #[test]
-    fn parse_pi_models_table_parses_rows_and_skips_header() {
-        let table = "provider      model                context  max-out  thinking  images\nkimi-coding   k3                   1.0M     131.1K   yes       yes   \nopenai-codex  gpt-5.6-luna         272K     128K     yes       yes   \nopenai-codex  gpt-5.3-codex-spark  128K     128K     yes       no    \n";
-        let models = parse_pi_models_table(table);
-        assert_eq!(models.len(), 3);
-        assert_eq!(models[0].selector, "kimi-coding/k3");
-        assert_eq!(models[0].context_window, Some(1_000_000));
-        assert_eq!(models[0].max_tokens, Some(131_100));
-        assert!(models[0].reasoning);
-        assert!(models[0].images);
-        assert_eq!(models[2].selector, "openai-codex/gpt-5.3-codex-spark");
-        assert!(!models[2].images);
-    }
-
-    #[test]
-    fn validate_pi_tiers_rejects_unknown_default_and_duplicate_agent() {
-        let mut tiers = BTreeMap::new();
-        tiers.insert(
-            "fast".to_string(),
-            PiTier {
-                model: "openai-codex/gpt-5.6-luna:low".to_string(),
-                fallback_models: vec![],
-                ..Default::default()
-            },
-        );
-        let mut assignments = BTreeMap::new();
-        assignments.insert("fast".to_string(), vec!["scout".to_string()]);
-
-        let no_shadow: HashSet<&str> = HashSet::new();
-        let unknown_default = PiTiersFile {
-            default: "missing".to_string(),
-            tiers: tiers.clone(),
-            assignments: assignments.clone(),
-            ..Default::default()
-        };
-        assert!(validate_pi_tiers(&unknown_default, &no_shadow).is_err());
-
-        assignments.insert("also-fast".to_string(), vec!["scout".to_string()]);
-        tiers.insert(
-            "also-fast".to_string(),
-            PiTier {
-                model: "openai-codex/gpt-5.5:low".to_string(),
-                fallback_models: vec![],
-                ..Default::default()
-            },
-        );
-        let duplicate_agent = PiTiersFile {
-            default: "fast".to_string(),
-            tiers,
-            assignments,
-            ..Default::default()
-        };
-        assert!(validate_pi_tiers(&duplicate_agent, &no_shadow).is_err());
-    }
-
-    #[test]
-    fn validate_pi_tiers_rejects_shadowed_provider_in_model_or_fallback() {
-        let mut tiers = BTreeMap::new();
-        tiers.insert(
-            "fast".to_string(),
-            PiTier {
-                model: "mistral/small:low".to_string(),
-                fallback_models: vec!["openai/gpt:high".to_string()],
-                ..Default::default()
-            },
-        );
-        let data = PiTiersFile {
-            default: "fast".to_string(),
-            tiers,
-            assignments: BTreeMap::new(),
-            ..Default::default()
-        };
-        let shadowed: HashSet<&str> = HashSet::from(["mistral"]);
-        assert!(validate_pi_tiers(&data, &shadowed).is_err());
-
-        let mut fallback_shadowed = data;
-        fallback_shadowed.tiers.get_mut("fast").unwrap().model = "openai/gpt:high".to_string();
-        fallback_shadowed
-            .tiers
-            .get_mut("fast")
-            .unwrap()
-            .fallback_models = vec!["mistral/backup:low".to_string()];
-        assert!(validate_pi_tiers(&fallback_shadowed, &shadowed).is_err());
-    }
-
-    #[test]
-    fn validate_pi_tiers_rejects_missing_or_unknown_thinking_suffixes() {
-        let no_shadow: HashSet<&str> = HashSet::new();
-        for invalid_model in [
-            "openai-codex/gpt-5.6-luna",
-            "openai-codex/gpt-5.6-luna:urgent",
-        ] {
-            let mut tiers = BTreeMap::new();
-            tiers.insert(
-                "fast".to_string(),
-                PiTier {
-                    model: invalid_model.to_string(),
-                    fallback_models: vec![],
-                    ..Default::default()
-                },
-            );
-            let invalid = PiTiersFile {
-                default: "fast".to_string(),
-                tiers,
-                assignments: BTreeMap::new(),
-                ..Default::default()
-            };
-            assert!(validate_pi_tiers(&invalid, &no_shadow).is_err());
-        }
-
-        let mut tiers = BTreeMap::new();
-        tiers.insert(
-            "fast".to_string(),
-            PiTier {
-                model: "openai-codex/gpt-5.6-luna:high".to_string(),
-                fallback_models: vec!["kimi-coding/k3".to_string()],
-                ..Default::default()
-            },
-        );
-        let invalid_fallback = PiTiersFile {
-            default: "fast".to_string(),
-            tiers,
-            assignments: BTreeMap::new(),
-            ..Default::default()
-        };
-        assert!(validate_pi_tiers(&invalid_fallback, &no_shadow).is_err());
-    }
-
-    #[test]
-    fn load_pi_roster_config_reads_model_owned_thinking_schema() {
-        let settings: serde_json::Map<String, JsonValue> = serde_json::from_str(
-            r#"{
-                "pi-roster": {
-                    "defaultModelProfile": "standard",
-                    "modelProfiles": {
-                        "standard": {
-                            "model": "openai-codex/gpt-5.6-luna:high",
-                            "fallbackModels": ["kimi-coding/k3:medium"]
-                        }
-                    },
-                    "assignments": {"standard": ["reviewer"]},
-                    "disabledAgents": ["worker"],
-                    "maxRecursionDepth": -1
-                }
-            }"#,
-        )
-        .expect("model-profile settings should parse");
-
-        let (tiers, exists) =
-            load_pi_roster_config(&settings).expect("model-profile config should load");
-        assert!(exists);
-        assert_eq!(tiers.default, "standard");
-        assert_eq!(
-            tiers.tiers["standard"].model,
-            "openai-codex/gpt-5.6-luna:high"
-        );
-        assert_eq!(
-            tiers.tiers["standard"].fallback_models,
-            vec!["kimi-coding/k3:medium"]
-        );
-        assert_eq!(tiers.disabled_agents, vec!["worker"]);
-        assert_eq!(tiers.max_recursion_depth, -1);
-    }
-
-    #[test]
-    fn load_pi_roster_config_rejects_removed_profile_thinking_field() {
-        let settings: serde_json::Map<String, JsonValue> = serde_json::from_str(
-            r#"{
-                "pi-roster": {
-                    "defaultModelProfile": "standard",
-                    "modelProfiles": {
-                        "standard": {
-                            "model": "openai-codex/gpt-5.6-luna:high",
-                            "thinking": "high"
-                        }
-                    },
-                    "assignments": {}
-                }
-            }"#,
-        )
-        .expect("legacy settings should remain valid JSON");
-
-        let error =
-            load_pi_roster_config(&settings).expect_err("profile-level thinking must be rejected");
-        assert!(error.contains("unknown field"));
-        assert!(error.contains("thinking"));
-    }
-
-    #[test]
-    fn save_pi_tiers_preserves_unrelated_settings_keys() {
-        let _home_guard = HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = temporary_home();
-        let agent = home.join(".pi").join("agent");
-        fs::create_dir_all(&agent).expect("test pi agent directory should be created");
-        fs::write(
-            agent.join("settings.json"),
-            "{\"theme\":\"dark\",\"packages\":[\"npm:pi-subagents\"],\"disabledProviders\":[\"ollama\",{\"path\":\"/repo\",\"providers\":[\"scoped-only\"]}],\"subagents\":{\"modelScope\":{\"enforce\":false}}}",
-        )
-        .expect("test settings.json should be written");
-
-        let bin_dir = home.join(".bun").join("bin");
-        fs::create_dir_all(&bin_dir).expect("mock bin directory should be created");
-        let mock_pi = bin_dir.join("pi");
-        fs::write(
-            &mock_pi,
-            "#!/bin/sh\necho 'provider      model  context  max-out  thinking  images'\necho 'openai-codex  gpt-5.6-luna  272K  128K  yes  yes'\n",
-        )
-        .expect("mock pi script should be written");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&mock_pi).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&mock_pi, permissions).expect("chmod");
-        }
-
-        let mut tiers = BTreeMap::new();
-        tiers.insert(
-            "fast".to_string(),
-            PiTier {
-                model: "openai-codex/gpt-5.6-luna:low".to_string(),
-                fallback_models: vec!["openai-codex/gpt-5.5:medium".to_string()],
-                ..Default::default()
-            },
-        );
-        let mut assignments = BTreeMap::new();
-        assignments.insert("fast".to_string(), vec!["scout".to_string()]);
-        let request = PiTiersFile {
-            default: "fast".to_string(),
-            tiers,
-            assignments,
-            disabled_agents: vec!["worker".to_string()],
-            max_recursion_depth: 3,
-        };
-
-        let previous_home = env::var_os("HOME");
-        env::set_var("HOME", &home);
-        let result = save_pi_tiers(request, vec!["mistral".to_string()], None);
-        if let Some(previous_home) = previous_home {
-            env::set_var("HOME", previous_home);
-        }
-        let snapshot =
-            result.expect("save_pi_tiers should succeed against the mocked pi executable");
-
-        assert_eq!(snapshot.tiers.default, "fast");
-        assert_eq!(snapshot.tiers.disabled_agents, vec!["worker".to_string()]);
-        assert_eq!(snapshot.tiers.max_recursion_depth, 3);
-        assert_eq!(
-            snapshot.shadowed_providers,
-            vec!["mistral".to_string()],
-            "shadowed providers must round-trip through pi's real disabledProviders"
-        );
-        let written: JsonValue = serde_json::from_str(
-            &fs::read_to_string(agent.join("settings.json")).expect("settings.json should exist"),
-        )
-        .expect("settings.json should stay valid JSON");
-        assert_eq!(written["theme"], JsonValue::String("dark".to_string()));
-        assert_eq!(
-            written["packages"][0],
-            JsonValue::String("npm:pi-subagents".to_string())
-        );
-        assert_eq!(
-            written["subagents"]["modelScope"]["enforce"], JsonValue::Bool(false),
-            "unrelated pre-existing settings keys (even ones a different extension owns) must survive Apply"
-        );
-        assert_eq!(
-            written["pi-roster"]["defaultModelProfile"],
-            JsonValue::String("fast".to_string())
-        );
-        assert_eq!(
-            written["pi-roster"]["modelProfiles"]["fast"]["model"],
-            JsonValue::String("openai-codex/gpt-5.6-luna:low".to_string()),
-            "pi-roster persists the complete model spec, not the obsolete tiers schema"
-        );
-        assert_eq!(
-            written["pi-roster"]["modelProfiles"]["fast"]["fallbackModels"][0],
-            JsonValue::String("openai-codex/gpt-5.5:medium".to_string())
-        );
-        assert!(
-            written["pi-roster"]["modelProfiles"]["fast"]
-                .get("thinking")
-                .is_none(),
-            "profile-level thinking must not be written"
-        );
-        assert!(
-            written["pi-roster"].get("tiers").is_none(),
-            "the obsolete tiers key must not be written to settings.json"
-        );
-        assert_eq!(
-            written["pi-roster"]["disabledAgents"][0],
-            JsonValue::String("worker".to_string())
-        );
-        assert_eq!(
-            written["pi-roster"]["maxRecursionDepth"],
-            JsonValue::from(3)
-        );
-        assert_eq!(
-            json_string_list(written.get("disabledProviders")),
-            vec!["mistral".to_string()],
-            "shadow toggles must write through to pi's real disabledProviders, fully replacing the prior global entries"
-        );
-        let disabled_providers = written["disabledProviders"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let scoped_entry_survived = disabled_providers.iter().any(|entry| {
-            entry
-                .get("providers")
-                .and_then(JsonValue::as_array)
-                .is_some_and(|providers| {
-                    providers
-                        .iter()
-                        .any(|provider| provider.as_str() == Some("scoped-only"))
-                })
-        });
-        assert!(
-            scoped_entry_survived,
-            "path-scoped disabledProviders entries configured outside Model Studio must survive Apply"
-        );
-
-        fs::remove_dir_all(home).expect("isolated test home should be removed");
-    }
-    #[test]
-    fn pi_provider_discovery_rejects_omp_only_api() {
-        let result = tauri::async_runtime::block_on(discover_custom_provider_models(
-            CustomProviderDiscoveryRequest {
-                provider_id: "gateway".to_string(),
-                base_url: "https://example.com/v1".to_string(),
-                api: "google-vertex".to_string(),
-                api_key: None,
-                target: Some("pi".to_string()),
-            },
-        ));
-        let error = result.expect_err("Pi should reject OMP-only provider APIs");
-        assert!(error.contains("不受 Pi 支持"));
-    }
-    #[test]
-    fn pi_custom_provider_save_preserves_models_json_fields() {
-        let _home_guard = HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = temporary_home();
-        let agent = home.join(".pi").join("agent");
-        fs::create_dir_all(&agent).expect("test Pi agent directory should be created");
-        fs::write(
-            agent.join("models.json"),
-            r#"{
-  // Pi accepts JSONC models files.
-  "providers": {
-    "gateway": {
-      "baseUrl": "https://old.example.com/v1",
-      "api": "openai-completions",
-      "apiKey": "OLD_KEY",
-      "headers": {"X-Team": "keep"},
-      "models": [
-        {"id": "keep", "name": "Keep model", "contextWindow": 123},
-        {"id": "drop", "name": "Drop model"},
-      ],
-    },
-    "unmanaged": {"discovery": {"type": "openai-models-list"}},
-  },
-  "otherSetting": true,
-}"#,
-        )
-        .expect("test models.json should be written");
-
-        let previous_home = env::var_os("HOME");
-        env::set_var("HOME", &home);
-        let result = save_custom_providers(CustomProviderSaveRequest {
-            custom_providers: vec![CustomProviderSave {
-                id: "gateway".to_string(),
-                base_url: "https://new.example.com/v1".to_string(),
-                api: "openai-responses".to_string(),
-                api_key: None,
-                models: vec![
-                    saved_model("keep", "openai-responses"),
-                    saved_model("new", "anthropic-messages"),
-                ],
-            }],
-            removed_custom_providers: Vec::new(),
-            target: Some("pi".to_string()),
-        });
-        if let Some(previous_home) = previous_home {
-            env::set_var("HOME", previous_home);
-        } else {
-            env::remove_var("HOME");
-        }
-
-        let providers = result.expect("Pi custom provider save should succeed");
-        assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].id, "gateway");
-        assert!(providers[0].api_key_configured);
-        assert_eq!(providers[0].models[0].id, "keep");
-        assert_eq!(providers[0].models[0].name, "Keep model");
-
-        let written: JsonValue = serde_json::from_str(
-            &fs::read_to_string(agent.join("models.json")).expect("saved models.json should exist"),
-        )
-        .expect("saved models.json should remain valid JSON");
-        assert_eq!(written["otherSetting"], JsonValue::Bool(true));
-        assert!(written["providers"]["unmanaged"].is_object());
-        assert!(
-            written["providers"]["gateway"].get("api").is_none(),
-            "managed providers must store API types on each model"
-        );
-        assert_eq!(
-            written["providers"]["gateway"]["apiKey"],
-            JsonValue::String("OLD_KEY".to_string())
-        );
-        assert_eq!(
-            written["providers"]["gateway"]["headers"]["X-Team"],
-            JsonValue::String("keep".to_string())
-        );
-        assert_eq!(
-            written["providers"]["gateway"]["models"][0]["name"],
-            JsonValue::String("Keep model".to_string())
-        );
-        assert_eq!(
-            written["providers"]["gateway"]["models"][0]["api"],
-            JsonValue::String("openai-responses".to_string())
-        );
-        assert_eq!(
-            written["providers"]["gateway"]["models"][1]["id"],
-            JsonValue::String("new".to_string())
-        );
-        assert_eq!(
-            written["providers"]["gateway"]["models"][1]["api"],
-            JsonValue::String("anthropic-messages".to_string())
-        );
-        assert!(written["providers"]["gateway"]["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|model| model["id"] != JsonValue::String("drop".to_string())));
-
-        fs::remove_dir_all(home).expect("isolated Pi home should be removed");
-    }
-
-    #[test]
-    fn pi_custom_provider_validation_rejects_omp_only_api() {
-        let provider = CustomProviderSave {
-            id: "gateway".to_string(),
-            base_url: "https://example.com/v1".to_string(),
-            api: "google-vertex".to_string(),
-            api_key: None,
-            models: vec![saved_model("model", "google-vertex")],
-        };
-        assert!(validate_pi_custom_providers(&[provider]).is_err());
-    }
-    #[test]
-    fn pi_empty_custom_provider_store_keeps_providers_object() {
-        let mut root = serde_json::Map::new();
-        set_pi_custom_providers(&mut root, &[], &[]);
-        assert_eq!(
-            root.get("providers"),
-            Some(&JsonValue::Object(serde_json::Map::new()))
-        );
-    }
-    #[test]
-    fn pi_models_file_initialization_writes_valid_empty_json() {
-        let _home_guard = HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = temporary_home();
-        let agent = home.join(".pi").join("agent");
-        let path = agent.join("models.json");
-        let previous_home = env::var_os("HOME");
-        env::set_var("HOME", &home);
-
-        ensure_pi_models_file(&path).expect("missing models.json should be initialized");
-        let written: JsonValue = serde_json::from_str(
-            &fs::read_to_string(&path).expect("initialized models.json should exist"),
-        )
-        .expect("initialized models.json should be valid JSON");
-        assert_eq!(
-            written["providers"],
-            JsonValue::Object(serde_json::Map::new())
-        );
-
-        fs::write(&path, " \n\t").expect("blank models.json should be writable");
-        ensure_pi_models_file(&path).expect("blank models.json should be repaired");
-        let repaired: JsonValue = serde_json::from_str(
-            &fs::read_to_string(&path).expect("repaired models.json should exist"),
-        )
-        .expect("repaired models.json should be valid JSON");
-        assert_eq!(
-            repaired["providers"],
-            JsonValue::Object(serde_json::Map::new())
-        );
-
-        if let Some(previous_home) = previous_home {
-            env::set_var("HOME", previous_home);
-        } else {
-            env::remove_var("HOME");
-        }
-        fs::remove_dir_all(home).expect("isolated test home should be removed");
-    }
     /// Install a mock `omp` that reports one chat row and one kind=image row.
     fn install_kind_role_mock(home: &Path) -> PathBuf {
         let agent = home.join(".omp").join("agent");

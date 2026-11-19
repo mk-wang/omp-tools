@@ -54,6 +54,11 @@ export type CustomProvider = {
   models: CustomProviderModel[];
 };
 
+export type CustomProviderStore = {
+  customProviders: CustomProvider[];
+  version: string;
+};
+
 export type CustomProviderSave = {
   id: string;
   baseUrl: string;
@@ -64,9 +69,9 @@ export type CustomProviderSave = {
 };
 
 export type CustomProviderSaveRequest = {
+  expectedVersion: string;
   customProviders: CustomProviderSave[];
   removedCustomProviders: string[];
-  target?: "omp" | "pi";
 };
 
 export type CustomProviderDiscoveryRequest = {
@@ -74,7 +79,6 @@ export type CustomProviderDiscoveryRequest = {
   baseUrl: string;
   api: string;
   apiKey: string | null;
-  target?: "omp" | "pi";
 };
 
 
@@ -116,6 +120,7 @@ export type ConfigSnapshot = {
   agentFiles: AgentDefinitionFile[];
   routingSettings: RoutingSettings;
   customProviders: CustomProvider[];
+  customProvidersVersion: string;
   warnings: string[];
 };
 
@@ -131,49 +136,4 @@ export type SaveRequest = {
   agentFiles: AgentFileSave[];
   routingSettings: RoutingSettings;
   ompPath: string | null;
-};
-
-export type PiModelOption = {
-  provider: string;
-  id: string;
-  selector: string;
-  contextWindow: number | null;
-  maxTokens: number | null;
-  reasoning: boolean;
-  images: boolean;
-  thinking?: string[];
-  defaultThinkingLevel?: string;
-};
-
-/** Studio's Tier editor shape; each model spec owns its thinking suffix. */
-export type PiTier = {
-  /** Complete provider/model-id:thinking spec for the primary attempt. */
-  model: string;
-  /** Complete provider/model-id:thinking specs tried after the primary. */
-  fallbackModels: string[];
-};
-
-
-export type PiTiersFile = {
-  /** Maps to pi-roster.defaultModelProfile on disk. */
-  default: string;
-  /** Maps to pi-roster.modelProfiles on disk. */
-  tiers: Record<string, PiTier>;
-  assignments: Record<string, string[]>;
-  /** Agent names pi-roster must never dispatch to, regardless of tier assignment. */
-  disabledAgents: string[];
-  /** Negative means unlimited, matching pi-roster's own semantics. */
-  maxRecursionDepth: number;
-};
-
-export type PiSnapshot = {
-  /** ~/.pi/agent/settings.json — pi-roster's "pi-roster" block lives inside it, no separate tiers file. */
-  settingsPath: string;
-  rosterConfigExists: boolean;
-  tiers: PiTiersFile;
-  models: PiModelOption[];
-  customProviders: CustomProvider[];
-  agentNames: string[];
-  shadowedProviders: string[];
-  warnings: string[];
 };
