@@ -1,5 +1,6 @@
 mod model_metadata;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value as YamlValue};
@@ -1452,33 +1453,104 @@ fn custom_provider_rich_models_url(models_url: &str) -> String {
     format!("{models_url}{separator}client_version={RICH_MODEL_CATALOG_CLIENT_VERSION}")
 }
 
-fn custom_provider_request(
-    client: &reqwest::Client,
-    url: &str,
+fn discovery_header_value(name: &HeaderName, value: &str) -> Result<HeaderValue, String> {
+    let mut header = HeaderValue::from_str(value)
+        .map_err(|_| format!("Provider 请求头 {name} 的值无效"))?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+fn resolve_discovery_header(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    let Some(command) = raw.strip_prefix('!') else {
+        return Ok(env::var(raw).ok().filter(|value| !value.is_empty())
+            .unwrap_or_else(|| raw.to_owned()));
+    };
+    // ponytail: read a single token file directly; never evaluate shell commands.
+    let unsupported = || "只支持用 !cat 引用请求头文件".to_string();
+    let (program, arg) = command.trim().split_once(char::is_whitespace).ok_or_else(unsupported)?;
+    if !matches!(program, "cat" | "/bin/cat" | "/usr/bin/cat") {
+        return Err(unsupported());
+    }
+    let arg = arg.trim();
+    let arg = arg.strip_prefix('"').and_then(|arg| arg.strip_suffix('"')).unwrap_or(arg);
+    let path = if let Some(relative) = arg.strip_prefix("~/")
+        .or_else(|| arg.strip_prefix("$HOME/"))
+        .or_else(|| arg.strip_prefix("${HOME}/"))
+    {
+        home_dir()?.join(relative)
+    } else if Path::new(arg).is_absolute() {
+        PathBuf::from(arg)
+    } else {
+        return Err(unsupported());
+    };
+    let unreadable = || "无法读取请求头文件".to_string();
+    if !fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= 8192) {
+        return Err(unreadable());
+    }
+    let value = fs::read_to_string(path).map_err(|_| unreadable())?;
+    if value.trim().is_empty() {
+        return Err("请求头文件为空".to_string());
+    }
+    Ok(value)
+}
+
+fn discovery_client(
     api: &str,
     api_key: &str,
-) -> reqwest::RequestBuilder {
-    let mut request_builder = client
-        .get(url)
-        .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {api_key}"));
+    draft_key: bool,
+    configured_headers: Option<&YamlValue>,
+) -> Result<reqwest::Client, String> {
+    let x_api_key = HeaderName::from_static("x-api-key");
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    let bearer = discovery_header_value(&AUTHORIZATION, &format!("Bearer {api_key}"))?;
+    headers.insert(AUTHORIZATION, bearer);
     if api == "anthropic-messages" {
-        request_builder = request_builder
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
+        let key = discovery_header_value(&x_api_key, api_key)?;
+        headers.insert(x_api_key.clone(), key);
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     }
-    request_builder
+    if let Some(configured_headers) = configured_headers {
+        let configured_headers = configured_headers.as_mapping()
+            .ok_or_else(|| "Provider headers 必须是映射".to_string())?;
+        for (name, raw) in configured_headers {
+            let name = name.as_str().and_then(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+                .ok_or_else(|| "Provider 请求头名称无效".to_string())?;
+            if draft_key && (name == AUTHORIZATION || (api == "anthropic-messages" && name == x_api_key)) {
+                continue;
+            }
+            let raw = raw.as_str().ok_or_else(|| format!("Provider 请求头 {name} 必须是字符串"))?;
+            let resolved = resolve_discovery_header(raw)
+                .map_err(|error| format!("Provider 请求头 {name}：{error}"))?;
+            if !resolved.trim().is_empty() {
+                let value = discovery_header_value(&name, resolved.trim())?;
+                headers.insert(name, value);
+            }
+        }
+    }
+    let redirect_limit = reqwest::redirect::Policy::default();
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().first().is_some_and(|url| url.origin() == attempt.url().origin()) {
+                redirect_limit.redirect(attempt)
+            } else {
+                attempt.stop()
+            }
+        }))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("创建 model discovery 客户端失败: {error}"))
 }
 
 async fn fetch_optional_custom_provider_rich_catalog(
     client: &reqwest::Client,
     models_url: &str,
-    api: &str,
-    api_key: &str,
     supported_apis: &[&str],
 ) -> Result<Option<Vec<CustomProviderModel>>, String> {
     let rich_url = custom_provider_rich_models_url(models_url);
-    let response = custom_provider_request(client, &rich_url, api, api_key)
+    let response = client.get(&rich_url)
         .timeout(Duration::from_secs(60))
         .send()
         .await
@@ -2968,45 +3040,46 @@ async fn discover_custom_provider_models(
         ));
     }
 
-    let existing_key = match target {
+    let base_url = reqwest::Url::parse(request.base_url.trim().trim_end_matches('/'))
+        .map_err(|_| "Base URL 无效".to_string())?;
+    let matches_base = |saved: &str| {
+        reqwest::Url::parse(saved.trim().trim_end_matches('/')).is_ok_and(|url| url == base_url)
+    };
+    let urls = custom_provider_model_urls(base_url.as_str())?;
+    let omp_config;
+    let (existing_key, configured_headers) = match target {
         "omp" => {
             let agent = agent_dir()?;
-            let models_path = models_file(&agent);
-            let (models_root, _) = load_models_yaml(&models_path)?;
-            existing_custom_provider(&models_root, provider_id)
+            (omp_config, _) = load_models_yaml(&models_file(&agent))?;
+            let saved = existing_custom_provider(&omp_config, provider_id)
                 .and_then(YamlValue::as_mapping)
-                .and_then(|config| mapping_string(config, "apiKey"))
+                .filter(|config| config.get("baseUrl").and_then(YamlValue::as_str).is_some_and(matches_base));
+            (
+                saved.and_then(|config| mapping_string(config, "apiKey")),
+                saved.and_then(|config| config.get("headers")),
+            )
         }
         "pi" => {
             let agent = pi_agent_dir()?;
-            let models_path = pi_models_file(&agent);
-            let (models_root, _) = load_pi_models_map(&models_path)?;
-            existing_pi_custom_provider(&models_root, provider_id)
+            let (models_root, _) = load_pi_models_map(&pi_models_file(&agent))?;
+            let key = existing_pi_custom_provider(&models_root, provider_id)
                 .and_then(JsonValue::as_object)
+                .filter(|config| config.get("baseUrl").and_then(JsonValue::as_str).is_some_and(matches_base))
                 .and_then(|config| config.get("apiKey"))
                 .and_then(JsonValue::as_str)
-                .map(str::to_string)
+                .map(str::to_string);
+            (key, None)
         }
         _ => unreachable!("custom provider target was validated above"),
     };
-    let raw_key = request
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_string)
-        .or(existing_key);
-    let api_key = raw_key
-        .as_deref()
+    let draft_key = request.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty());
+    let api_key = draft_key
+        .or(existing_key.as_deref())
         .and_then(resolve_custom_provider_api_key)
-        .ok_or_else(|| format!("Custom provider “{provider_id}”需要 API key"))?;
-    let urls = custom_provider_model_urls(&request.base_url)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("创建 model discovery 客户端失败: {error}"))?;
+        .ok_or_else(|| format!("Custom provider “{provider_id}”需要此 Base URL 的 API key"))?;
+    let client = discovery_client(api, &api_key, draft_key.is_some(), configured_headers)?;
     for (index, url) in urls.iter().enumerate() {
-        let response = custom_provider_request(&client, url, api, &api_key)
+        let response = client.get(url)
             .send()
             .await
             .map_err(|error| format!("读取 provider model 列表失败（GET {url}）：{error}"))?;
@@ -3021,7 +3094,7 @@ async fn discover_custom_provider_models(
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(format!(
-                "provider model 列表鉴权失败（HTTP {status}），请检查 API key"
+                "provider model 列表鉴权失败（HTTP {status}），请检查 API key 与 provider 请求头"
             ));
         }
         let body = response
@@ -3038,8 +3111,6 @@ async fn discover_custom_provider_models(
         let rich_models = fetch_optional_custom_provider_rich_catalog(
             &client,
             url,
-            api,
-            &api_key,
             supported_apis,
         )
         .await?
@@ -3889,15 +3960,22 @@ mod tests {
 
         let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = temporary_home();
-        fs::create_dir_all(home.join(".omp/agent")).unwrap();
+        let agent = home.join(".omp/agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("edge-token"), "test-edge-token\n").unwrap();
         for (status, rich_body, optional) in [
             ("404 Not Found", "", true),
             ("405 Method Not Allowed", "", true),
+            ("302 Found", "", false),
             ("503 Service Unavailable", "", false),
             ("200 OK", "invalid JSON", false),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
+            let base_url = format!("http://{address}/v1");
+            fs::write(agent.join("models.yml"), format!(
+                "providers:\n  test-provider:\n    baseUrl: {base_url}\n    apiKey: test-key\n    headers:\n      X-CLI-Proxy-Access: '!/bin/cat ~/.omp/agent/edge-token'\n"
+            )).unwrap();
             let server = std::thread::spawn(move || {
                 for index in 0..2 {
                     let (mut stream, _) = listener.accept().unwrap();
@@ -3918,6 +3996,7 @@ mod tests {
                     assert!(request.contains("authorization: bearer test-key"));
                     assert!(request.contains("x-api-key: test-key"));
                     assert!(request.contains("anthropic-version: 2023-06-01"));
+                    assert!(request.contains("x-cli-proxy-access: test-edge-token\r\n"));
                     let (status, body) = if index == 0 {
                         assert!(request.contains("get /v1/models http/1.1"));
                         ("200 OK", r#"{"data":[{"id":"model-a"},{"id":"model-b"}]}"#)
@@ -3925,31 +4004,41 @@ mod tests {
                         assert!(request.contains("get /v1/models?client_version=0.144.1 http/1.1"));
                         (status, rich_body)
                     };
+                    let redirect = if status == "302 Found" {
+                        "Location: http://127.0.0.1:0/models\r\n"
+                    } else {
+                        ""
+                    };
                     write!(stream,
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                        "HTTP/1.1 {status}\r\n{redirect}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
                     ).unwrap();
                 }
             });
             let previous_home = env::var_os("HOME");
             env::set_var("HOME", &home);
-            let result = tauri::async_runtime::block_on(discover_custom_provider_models(
+            let discover = |base_url| tauri::async_runtime::block_on(discover_custom_provider_models(
                 CustomProviderDiscoveryRequest {
                     provider_id: "test-provider".to_string(),
-                    base_url: format!("http://{address}/v1"),
+                    base_url,
                     api: "anthropic-messages".to_string(),
-                    api_key: Some("test-key".to_string()),
+                    api_key: None,
                     target: None,
                 },
             ));
+            let mismatched = discover(format!("{base_url}/other"));
+            let result = discover(format!("{base_url}/"));
             if let Some(previous_home) = previous_home {
                 env::set_var("HOME", previous_home);
             } else {
                 env::remove_var("HOME");
             }
             server.join().unwrap();
+            assert!(matches!(mismatched, Err(message) if message.contains("API key")));
             if optional {
                 let models = result.expect("unsupported rich endpoint should retain the ordinary catalog");
                 assert_eq!(models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(), ["model-a", "model-b"]);
+            } else if status == "302 Found" {
+                assert!(matches!(result, Err(message) if message.contains("HTTP 302")));
             } else {
                 assert!(result.is_err(), "{status} must not silently discard model metadata");
             }

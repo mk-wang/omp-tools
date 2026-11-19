@@ -93,7 +93,8 @@ omp models --json
 保存 Custom Provider 不检查模型是否仍被 config 引用，也不自动修改这些引用。保存成功后，应用重新读取磁盘 config，并复用现有校验提示非法模型或引用。重新读取会替换尚未 Apply 的草稿，与手动“重新读取”一致。Provider 参数和模型元数据的格式校验仍在保存前执行。
 
 - Custom provider ID 只能包含字母、数字、`-`、`_`、`.`；Base URL 必须是 `http://` 或 `https://`；总 Type 和每个 model 的最终 Type 必须是 OMP 支持的 API；必须成功获取 model list，并至少勾选一个 model。
-- Model list 请求：Base URL 已带 `/vN` 时请求 `<baseUrl>/models`，否则依次尝试 `<baseUrl>/v1/models` 与 `<baseUrl>/v3/models`。请求发送 `Authorization: Bearer <apiKey>`；Anthropic 还发送对应鉴权头。普通列表决定可用模型和已返回的容量；可选 `?client_version=0.144.1` rich catalog 补充缺失元数据及 thinking effort，不添加普通列表没有的模型。忽略 `visibility: hide` 的能力及当前不支持的 `ultra`。
+- Model list 请求：Base URL 已带 `/vN` 时请求 `<baseUrl>/models`，否则依次尝试 `<baseUrl>/v1/models` 与 `<baseUrl>/v3/models`。默认发送 `Authorization: Bearer <apiKey>`；Anthropic 还发送对应鉴权头。普通列表决定可用模型和已返回的容量；可选 `?client_version=0.144.1` rich catalog 补充缺失元数据及 thinking effort，不添加普通列表没有的模型。忽略 `visibility: hide` 的能力及当前不支持的 `ultra`。
+- 编辑已保存的 Provider 时，只有 Base URL 与已保存的地址一致，Studio 才会复用已保存的凭据。OMP 的两种列表请求均读取 `models.yml` 中该 Provider 的 `headers`。头值可使用字符串、环境变量名或 `!cat ~/path/to/token` 单文件引用。Studio 直接读取文件，不执行 Shell 命令。模型列表请求不跟随跨源重定向。
 - 容量字段：`context_length`、`max_model_len`、`context_window` 映射到 `contextWindow`；`max_output_tokens`、`max_completion_tokens`、`top_provider.max_completion_tokens`、`max_tokens` 映射到 `maxTokens`。`limits.max_input_tokens` 和 `limits.max_output_tokens` 同时存在时，两者之和可提供上下文窗口。容量别名接受正的安全整数及其数字字符串；未返回的容量不猜值。
 - 自定义 Role 名称不能覆盖 OMP 系统 Role，且必须以小写字母开头，只能包含小写字母、数字、`-`、`_`。
 - 自定义 Role 必须选择模型。
